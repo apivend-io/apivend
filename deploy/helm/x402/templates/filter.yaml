@@ -1,0 +1,128 @@
+# The filter reads its price table through the API: every replica sees a
+# policy change within about a second. A mounted ConfigMap is refreshed by
+# each kubelet on its own schedule, up to a minute apart, and in between one
+# replica charges for a route while another serves it free.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: x402-filter
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: x402-filter
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+rules:
+  # One object, read-only. resourceNames applies to list and watch because
+  # the filter selects the object by name.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["x402-routes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: x402-filter
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: x402-filter
+subjects:
+  - kind: ServiceAccount
+    name: x402-filter
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: x402-filter
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+    app.kubernetes.io/component: filter
+spec:
+  replicas: {{ .Values.filter.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: filter
+  template:
+    metadata:
+      labels:
+        {{- include "x402.labels" . | nindent 8 }}
+        app.kubernetes.io/component: filter
+      {{- if .Values.metrics.annotations }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9102"
+      {{- end }}
+    spec:
+      serviceAccountName: x402-filter
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "x402.podSecurity" . | nindent 6 }}
+      containers:
+        - name: filter
+          image: {{ include "x402.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/x402-filter"]
+          args:
+            - -listen=:9002
+            - -metrics=:9102
+            - -config-configmap=x402-routes   # written by the controller
+            - -min-validity-remaining={{ .Values.filter.minValidityRemaining }}
+            - -chain-read-timeout={{ .Values.filter.chainReadTimeout }}
+            - -credit-confirmations={{ .Values.filter.creditConfirmations }}
+            {{- if .Values.hostedState.url }}
+            - -hosted-state={{ .Values.hostedState.url }}
+            {{- end }}
+            {{- include "x402.rpcArgs" . | nindent 12 }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- include "x402.redisEnv" . | nindent 12 }}
+            {{- include "x402.rpcEnv" . | nindent 12 }}
+            {{- if .Values.hostedState.url }}
+            - name: X402_HOSTED_STATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "hostedState.existingSecret.name is required with hostedState.url" .Values.hostedState.existingSecret.name }}
+                  key: {{ .Values.hostedState.existingSecret.key }}
+            {{- end }}
+          ports:
+            - { name: grpc, containerPort: 9002 }
+            - { name: metrics, containerPort: 9102 }
+          readinessProbe:
+            grpc: { port: 9002 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: metrics }
+          {{- include "x402.containerSecurity" . | nindent 10 }}
+          resources:
+            {{- toYaml .Values.filter.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: x402-filter
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+    app.kubernetes.io/component: filter
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: filter
+  ports:
+    - name: grpc
+      port: 9002
+      targetPort: grpc
+      appProtocol: kubernetes.io/h2c

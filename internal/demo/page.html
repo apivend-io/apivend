@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>apivend demo</title>
+<meta name="description" content="Pay-per-request APIs over x402: live prices and real settled payments in USDC on Base.">
+<link rel="icon" href="/favicon.ico" sizes="48x48">
+<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<style>
+  @font-face { font-family: "Space Grotesk"; src: url(/assets/space-grotesk.woff2) format("woff2"); font-weight: 400 600; font-display: swap; }
+  @font-face { font-family: "JetBrains Mono"; src: url(/assets/jetbrains-mono.woff2) format("woff2"); font-weight: 500; font-display: swap; }
+
+  :root {
+    --ink: #0E1116; --paper: #F6F7F9; --coin: #F2B03D; --slate: #3A4150; --mist: #A7AFBD;
+    --page: var(--paper); --text: var(--ink); --muted: #545C6B; --rule: #D9DDE3;
+    --panel: var(--ink); --panel-text: var(--paper); --panel-muted: var(--mist); --panel-rule: #262C36;
+    --tape: #FFFFFF; --tape-text: var(--ink); --tape-muted: #5E6675; --tape-rule: #E3E6EA;
+    --code-bg: #E9ECF0; --focus: #2F6FEB;
+    --sans: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --page: #0E1116; --text: var(--paper); --muted: var(--mist); --rule: #262C36;
+            --panel: #161A21; --panel-rule: #2A303B; --code-bg: #161A21; --focus: #7FA8FF; }
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; background: var(--page); color: var(--text); font: 400 16px/1.55 var(--sans); }
+  a { color: inherit; text-underline-offset: 3px; text-decoration-thickness: 1px; }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; border-radius: 2px; }
+  code, .mono { font-family: var(--mono); font-weight: 500; font-variant-ligatures: none; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 16px; }
+
+  /* The machine: the dark panel with the menu. */
+  .machine { background: var(--panel); color: var(--panel-text); padding: 20px 0 0; }
+  .top { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+  .top img { height: 30px; width: auto; display: block; }
+  .top a { color: var(--panel-muted); font-size: 14px; text-decoration: none; }
+  .top a:hover { color: var(--panel-text); }
+  .front { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 48px; padding: 56px 0 0; }
+  h1 { font-weight: 600; font-size: clamp(34px, 5.2vw, 52px); line-height: 1.04; letter-spacing: -0.025em; margin: 0 0 20px; }
+  h1 span { display: block; }
+  .lede { color: var(--panel-muted); font-size: 18px; line-height: 1.5; max-width: 54ch; margin: 0 0 40px; }
+
+  /* The menu: a grid of cards, one per API, each with a price tag. */
+  .menu { list-style: none; margin: 0; padding: 0 0 56px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .item { display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 16px; border: 1px solid var(--panel-rule); border-radius: 6px; }
+  .item:only-child { grid-column: 1 / -1; }
+  .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+  .item h2 { font-size: 18px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.25; margin: 0; }
+  .item p { color: var(--panel-muted); margin: 0; font-size: 14px; line-height: 1.5; }
+  .tag { flex: none; text-align: right; }
+  .price { display: inline-block; background: var(--coin); color: var(--ink); font: 500 14px/1 var(--mono); padding: 7px 9px 6px; border-radius: 3px; font-variant-numeric: tabular-nums; }
+  .price.test { background: transparent; color: var(--panel-text); box-shadow: inset 0 0 0 1px var(--mist); }
+  .per { display: block; color: var(--panel-muted); font-size: 12px; margin-top: 5px; white-space: nowrap; }
+  /* The URL on one line, cut with an ellipsis; Copy takes the whole URL. */
+  .url { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: auto; padding-top: 4px; min-width: 0; }
+  .url code { flex: 1 1 100%; min-width: 0; font-size: 12px; color: var(--panel-text); background: var(--panel-rule); padding: 5px 8px; border-radius: 3px;
+              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .copy { font: 500 13px var(--sans); color: var(--panel-text); background: none; border: 1px solid var(--panel-rule); border-radius: 3px; padding: 4px 9px; cursor: pointer; flex: none; }
+  .copy:hover { border-color: var(--mist); }
+  .down { color: var(--coin); font-size: 14px; }
+
+  /* The meter: the machine's own counters, top right. */
+  .side { display: flex; flex-direction: column; justify-content: space-between; gap: 24px; }
+  .meter h2 { font-size: 15px; font-weight: 500; color: var(--panel-muted); margin: 6px 0 10px; }
+  .flow { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--panel-rule); }
+  .flow li { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--panel-rule); font-size: 14px; }
+  .flow span { color: var(--panel-muted); }
+  .flow b { font: 500 20px var(--mono); font-variant-numeric: tabular-nums; color: var(--panel-text); }
+  .flow li.settled b { color: var(--coin); }
+  .meter .own-note { margin: 10px 0 0; font-size: 13px; color: var(--panel-muted); max-width: 40ch; }
+  .meter .own-note .mono { color: var(--panel-text); }
+
+  /* The slot at the machine's bottom edge, and the tape hanging from it. */
+  .stage { position: relative; height: 260px; margin: 0 -8px; }
+  .stage canvas, .stage img { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .stage img { object-fit: contain; padding: 64px; }
+  .under { display: flex; flex-direction: column; align-items: center; text-align: center; min-height: 22px; padding: 0 0 8px; }
+  .head { margin: 0; color: var(--panel-muted); font-size: 13px; }
+  .head .mono { color: var(--panel-text); font-variant-numeric: tabular-nums; }
+  .flat-note { display: none; margin: 0 0 4px; color: var(--panel-muted); font-size: 13px; max-width: 30ch; }
+  .side:has(.stage.flat) .flat-note { display: block; }
+  .coin-tag { position: absolute; left: 0; top: 0; pointer-events: none; white-space: nowrap; font: 500 12px/1.3 var(--mono);
+              color: var(--panel-text); background: var(--panel); border: 1px solid var(--coin); border-radius: 3px; padding: 4px 7px; will-change: transform, opacity; }
+  .coin-tag[hidden] { display: none; }
+  .slot { height: 12px; border-radius: 6px 6px 0 0; background: #05070A; box-shadow: inset 0 3px 4px rgba(0,0,0,.7); margin: 0 -8px; }
+  .hang { margin-top: -56px; filter: drop-shadow(0 1px 1px rgba(14,17,22,.18)) drop-shadow(0 6px 10px rgba(14,17,22,.06)); }
+  .tape { position: relative; z-index: 1; margin: 0 6px; background: var(--tape); color: var(--tape-text);
+
+          padding: 18px 18px 30px; font-size: 14px;
+          --tooth: 8px;
+          -webkit-mask: linear-gradient(#000 0 0) top / 100% calc(100% - var(--tooth)) no-repeat,
+                        conic-gradient(from -45deg at bottom, #0000, #000 1deg 89deg, #0000 90deg) bottom / calc(2 * var(--tooth)) var(--tooth) repeat-x;
+                  mask: linear-gradient(#000 0 0) top / 100% calc(100% - var(--tooth)) no-repeat,
+                        conic-gradient(from -45deg at bottom, #0000, #000 1deg 89deg, #0000 90deg) bottom / calc(2 * var(--tooth)) var(--tooth) repeat-x; }
+  .tape header { text-align: center; padding-bottom: 12px; border-bottom: 1px dashed var(--tape-rule); }
+  .tape header img { height: 22px; display: block; margin: 0 auto 6px; }
+  .tape header p { margin: 0; color: var(--tape-muted); font-size: 13px; }
+  .receipts { list-style: none; margin: 0; padding: 0; }
+  .receipt { padding: 12px 0; border-bottom: 1px dashed var(--tape-rule); display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; }
+  .receipt .what { font-weight: 500; }
+  .receipt .amt { font: 500 14px var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
+  .receipt .meta { grid-column: 1 / -1; color: var(--tape-muted); font: 500 12px/1.6 var(--mono); display: flex; flex-wrap: wrap; gap: 0 12px; }
+  .receipt .meta a { color: var(--tape-text); }
+  .tape .empty { color: var(--tape-muted); padding: 16px 0 4px; margin: 0; text-align: center; }
+  .burst { margin: 6px 0 0; font: 500 13px var(--mono); color: var(--tape-text); }
+  .totals { padding-top: 12px; }
+  .totals > p { margin: 0 0 4px; font-weight: 600; }
+  .totals dl { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; margin: 0; font-size: 13px; }
+  .totals dt { color: var(--tape-muted); }
+  .totals dd { margin: 0; font: 500 13px var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
+  @media (prefers-reduced-motion: no-preference) {
+    .receipt.new { animation: print .7s steps(7) both; }
+    @keyframes print { from { clip-path: inset(0 0 100% 0); } to { clip-path: inset(0 0 0 0); } }
+  }
+
+  /* The page below the machine. */
+  .below { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 48px; padding-top: 56px; padding-bottom: 72px; }
+  .below h2 { font-size: 28px; font-weight: 600; letter-spacing: -0.015em; line-height: 1.15; margin: 0 0 8px; }
+  .below > div > p { color: var(--muted); max-width: 62ch; margin: 0 0 24px; }
+  .steps { list-style: none; counter-reset: step; margin: 0; padding: 0; }
+  .steps li { counter-increment: step; position: relative; padding: 0 0 28px 48px; }
+  .steps li::before { content: counter(step); position: absolute; left: 0; top: -2px; width: 30px; height: 30px; border-radius: 50%;
+                      background: var(--coin); color: var(--ink); font-weight: 600; display: grid; place-items: center; font-size: 15px; }
+  .steps li:not(:last-child)::after { content: ""; position: absolute; left: 14.5px; top: 34px; bottom: 6px; width: 1px; background: var(--rule); }
+  .steps h3 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  .steps p { margin: 0 0 10px; color: var(--muted); max-width: 60ch; }
+  .below h2.runs { margin-top: 48px; }
+  .stack { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 10px 24px; margin: 0; max-width: 64ch; border-top: 1px solid var(--rule); padding-top: 16px; }
+  .stack dt { font-weight: 600; }
+  .stack dd { margin: 0; color: var(--muted); }
+  pre { margin: 0; background: var(--code-bg); border-radius: 4px; padding: 12px 14px; overflow-x: auto; font: 500 13px/1.6 var(--mono); }
+  /* The commands wrap instead of scrolling sideways. */
+  .steps pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  pre code { font: inherit; }
+  footer { border-top: 1px solid var(--rule); color: var(--muted); font-size: 14px; padding: 20px 0 32px; }
+  footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+
+  @media (max-width: 560px) { .menu { grid-template-columns: minmax(0, 1fr); } }
+  @media (max-width: 860px) {
+    .front, .below { grid-template-columns: minmax(0, 1fr); gap: 32px; }
+    .front { padding-top: 40px; }
+    .menu { padding-bottom: 8px; }
+    .side { gap: 16px; }
+    .stage { height: 220px; }
+    .below { padding-top: 0; }
+    .hang { order: -1; margin-top: 0; }
+  }
+</style>
+</head>
+<body>
+<div class="machine">
+  <div class="wrap">
+    <div class="top">
+      <img src="/assets/apivend-lockup-on-dark.svg" alt="apivend" width="107" height="30">
+      <a href="https://apivend.io">apivend.io</a>
+    </div>
+    <div class="front">
+      <div>
+        <h1><span>Pay per request.</span> <span>No account, no API key.</span></h1>
+        <p class="lede">Each API here answers its first request with <span class="mono">402 Payment Required</span> and a price. Sign a USDC payment with any x402 client, send the request again, and the answer comes back. Every receipt on the tape is a real settlement on chain.</p>
+        <ul class="menu" id="menu" aria-live="polite"><li class="item"><p>Loading the menu…</p></li></ul>
+      </div>
+      <div class="side">
+        <section class="meter" aria-labelledby="countsTitle">
+          <h2 id="countsTitle">All payments so far, all routes</h2>
+          <ul class="flow" id="flow"></ul>
+          <p class="own-note" id="ownNote" hidden></p>
+        </section>
+        <div class="stage" id="stage" aria-hidden="true"></div>
+        <div class="under">
+          <p class="flat-note">A coin drops here each time a payment settles on chain.</p>
+          <p class="head" id="head" hidden><span id="headNet">Base</span> block <span class="mono" id="headBlock"></span></p>
+        </div>
+        <div class="slot" aria-hidden="true"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<main class="wrap below">
+  <div>
+    <h2>How to pay for a request</h2>
+    <p>Start with the sandbox: it takes test USDC on Base Sepolia, which you can get free from <a href="https://faucet.circle.com" rel="noopener">Circle's faucet</a>. Use a throwaway key either way.</p>
+    <ol class="steps">
+      <li><h3>Ask without paying</h3>
+        <p>The gateway answers <span class="mono">402</span>. The price, the token and the address to pay are in the <span class="mono">PAYMENT-REQUIRED</span> header.</p>
+        <pre><code id="cmdAsk">curl -i …</code></pre></li>
+      <li><h3>Pay and ask again</h3>
+        <p>An x402 client signs a USDC authorization for exactly that price and repeats the request with it. Nothing moves until the API has answered.</p>
+        <pre><code id="cmdPay">X402_PRIVATE_KEY=0x… x402-pay …</code></pre></li>
+      <li><h3>Find your receipt</h3>
+        <p>Once the payment settles on chain, usually within seconds, it prints on the tape with a link to the transaction.</p></li>
+    </ol>
+
+    <h2 class="runs">What runs this page</h2>
+    <p>This page is a reference deployment of apivend, the payment gateway these APIs sit behind. The APIs themselves are ordinary HTTP services with no payment code.</p>
+    <dl class="stack">
+      <dt>Gateway</dt><dd>Envoy Gateway with apivend's x402 filter. It prices each route and checks every payment before the request reaches the API.</dd>
+      <dt>Prices</dt><dd>A <span class="mono">PaymentPolicy</span> per route, kept in Kubernetes. Changing a price takes effect in under a second.</dd>
+      <dt>Cluster</dt><dd>A single-node Kubernetes cluster (k3s), deployed from git by Flux.</dd>
+      <dt>Settlement</dt><dd>Coinbase's facilitator on Base. The sandbox uses the free x402.org facilitator.</dd>
+      <dt>Chain reads</dt><dd>Balances and blocks straight from Base over RPC. No payment is served on old data.</dd>
+    </dl>
+  </div>
+  <aside class="hang">
+    <section class="tape" aria-labelledby="tapeTitle">
+      <header>
+        <img src="/assets/apivend-lockup-on-light.svg" alt="" width="78" height="22">
+        <p id="tapeTitle">Settled payments, newest first</p>
+        <p class="burst" id="burst" hidden></p>
+      </header>
+      <ul class="receipts" id="receipts" aria-live="polite"></ul>
+      <div class="totals" id="totals" hidden><p>All payments so far</p><dl id="totalsList"></dl></div>
+    </section>
+  </aside>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Payments use the x402 protocol: HTTP 402 and USDC authorizations (EIP-3009).</span>
+    <a href="https://apivend.io">apivend.io</a>
+  </div>
+</footer>
+
+<script type="importmap">{ "imports": { "three": "/assets/three.module.min.js" } }</script>
+<script type="module" src="/assets/slot.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const el = (tag, props = {}, ...kids) => { const e = Object.assign(document.createElement(tag), props); e.append(...kids); return e; };
+const nets = { 'eip155:8453': 'Base', 'eip155:84532': 'Base Sepolia' };
+const testnets = new Set(['eip155:84532']);
+const usd = atomic => '$' + (Number(atomic) / 1e6).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 6 });
+const short = s => s && s.length > 14 ? s.slice(0, 6) + '…' + s.slice(-4) : (s || '');
+const clock = iso => new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+const day = iso => { const d = new Date(iso); return d.toDateString() === new Date().toDateString() ? 'today' : d.toLocaleDateString([], { day: 'numeric', month: 'short' }); };
+let names = {}, seen = null;
+
+async function menu() {
+  const rs = await (await fetch('/api/routes')).json();
+  names = Object.fromEntries(rs.filter(r => r.key).map(r => [r.key, r.name]));
+  if (!rs.length) { $('menu').replaceChildren(el('li', { className: 'item' }, el('p', { textContent: 'No APIs are on the menu yet.' }))); return; }
+  // Paid APIs first, the sandbox after.
+  const isTest = r => r.terms && r.terms.accepts.length > 0 && r.terms.accepts.every(a => testnets.has(a.network));
+  rs.sort((a, b) => isTest(a) - isTest(b));
+  $('menu').replaceChildren(...rs.map(r => {
+    const a = r.terms && r.terms.accepts[0];
+    const test = isTest(r);
+    const head = el('div', { className: 'card-head' }, el('h2', { textContent: r.name }));
+    const item = el('li', { className: 'item' }, head);
+    if (a) {
+      head.append(el('div', { className: 'tag' },
+        el('span', { className: 'price' + (test ? ' test' : ''), textContent: usd(a.amount) }),
+        el('span', { className: 'per', textContent: test ? 'test USDC, ' + (nets[a.network] || a.network) : 'USDC on ' + (nets[a.network] || a.network) })));
+    }
+    if (r.note) item.append(el('p', { textContent: r.note }));
+    if (!r.priced) item.append(el('span', { className: 'down', textContent: r.status ? 'Not taking payments right now (answered ' + r.status + ').' : 'No price is set right now.' }));
+    // Two things to copy: a command anyone can run, and a line for an
+    // agent with a wallet tool (today's actual buyers).
+    const copyButton = (label, text) => {
+      const b = el('button', { className: 'copy', type: 'button', textContent: label });
+      b.addEventListener('click', async () => {
+        try { await navigator.clipboard.writeText(text()); b.textContent = 'Copied'; } catch { b.textContent = 'Copy failed'; }
+        setTimeout(() => { b.textContent = label; }, 1600);
+      });
+      return b;
+    };
+    const where = a ? (test ? 'test USDC on ' + (nets[a.network] || a.network) + ' (free from faucet.circle.com)' : 'USDC on ' + (nets[a.network] || a.network)) : 'USDC';
+    const price = a ? usd(a.amount) + ' in ' + where : 'a price in ' + where;
+    const curl = copyButton('Copy curl', () => 'curl -i "' + r.url + '"');
+    const prompt = copyButton('Copy prompt', () => 'Use your x402 wallet tool to call ' + r.url + ' . It answers 402 Payment Required and costs ' + price + '. Pay it, then show me the answer.');
+    // Shown without the scheme and cut to the card; the title and Copy carry the whole URL.
+    item.append(el('div', { className: 'url' }, el('code', { textContent: r.url.replace(/^https?:\/\//, ''), title: r.url }), curl, prompt));
+    return item;
+  }));
+  const first = (rs.find(isTest) || rs.find(r => r.priced) || rs[0]).url;
+  $('cmdAsk').textContent = 'curl -i "' + first + '"';
+  $('cmdPay').textContent = 'X402_PRIVATE_KEY=0x… x402-pay "' + first + '"\n\n# or any x402 client, e.g. @x402/fetch in JavaScript';
+}
+
+// The tape keeps a fixed length: the newest TAPE receipts. Receipts whose coin
+// is still on its way are held back until it enters the slot.
+const TAPE = 8;
+// tape: what has printed, newest first (by settlement time), at most TAPE.
+let tape = [], held = new Set(), printing = new Set(), lastCount = null, burstTimer;
+const onTape = p => { if (!tape.some(q => q.txHash === p.txHash)) tape.push(p);
+  tape.sort((a, b) => new Date(b.at) - new Date(a.at)); tape = tape.slice(0, TAPE); };
+const fmtBlock = n => Number(n).toLocaleString('en-US');
+async function receipts() {
+  const [ps, totals] = await Promise.all([(await fetch('/api/feed')).json(), (await fetch('/api/totals')).json().catch(() => [])]);
+  const first = seen === null;
+  const fresh = seen ? ps.filter(p => !seen.has(p.txHash)) : [];
+  seen = new Set(ps.map(p => p.txHash));
+  // On the first load everything already on the feed goes on the tape.
+  if (first) for (const p of ps) onTape(p);
+  // How many really settled since the last check: the feed shows at most 25.
+  const count = totals.reduce((t, x) => t + x.count, 0);
+  const arrived = lastCount == null ? fresh.length : Math.max(fresh.length, count - lastCount);
+  lastCount = count;
+  drawTotals(totals);
+  if (arrived > TAPE) {
+    $('burst').textContent = '+' + arrived.toLocaleString('en-US') + ' settled in the last 5 seconds';
+    $('burst').hidden = false; clearTimeout(burstTimer);
+    burstTimer = setTimeout(() => { $('burst').hidden = true; }, 9000);
+  }
+  if (fresh.length && window.apivendSlot) {
+    for (const p of fresh) held.add(p.txHash);
+    const p0 = fresh[0];
+    const label = usd(p0.amount) + ' settled in block ' + fmtBlock(p0.block) + (testnets.has(p0.network) ? ' on ' + (nets[p0.network] || p0.network) : '');
+    window.apivendSlot.settle(fresh, batch => {
+      for (const p of batch) { held.delete(p.txHash); printing.add(p.txHash); onTape(p); }
+      draw();
+    }, label);
+  } else {
+    for (const p of fresh) { printing.add(p.txHash); onTape(p); }
+  }
+  draw();
+}
+function drawTotals(totals) {
+  if (!totals.length) { $('totals').hidden = true; return; }
+  const rows = [];
+  for (const t of totals) {
+    const test = testnets.has(t.network);
+    rows.push(el('dt', { textContent: t.count.toLocaleString('en-US') + (t.count === 1 ? ' payment' : ' payments') + (test ? ' in the sandbox' : ' on ' + (nets[t.network] || t.network)) }),
+              el('dd', { textContent: usd(t.amount) + (test ? ' test' : '') }));
+  }
+  $('totalsList').replaceChildren(...rows); $('totals').hidden = false;
+}
+function draw() {
+  const ps = tape;
+  if (!ps.length) {
+    $('receipts').replaceChildren(el('li', {}, el('p', { className: 'empty', textContent: 'No receipts yet. Pay for a request and yours prints here.' })));
+    return;
+  }
+  $('receipts').replaceChildren(...ps.map(p => {
+    const li = el('li', { className: 'receipt' + (printing.has(p.txHash) ? ' new' : '') },
+      el('span', { className: 'what', textContent: names[p.route] || p.route }),
+      el('span', { className: 'amt', textContent: usd(p.amount) }));
+    const tx = p.txUrl ? el('a', { href: p.txUrl, textContent: short(p.txHash), rel: 'noopener', target: '_blank', title: 'Transaction ' + p.txHash }) : el('span', { textContent: short(p.txHash) });
+    li.append(el('span', { className: 'meta' },
+      el('span', { textContent: day(p.at) + ' ' + clock(p.at), title: new Date(p.at).toISOString() }),
+      el('span', { textContent: nets[p.network] || p.network }),
+      el('span', { textContent: p.own ? 'our test wallet' : 'from ' + short(p.payer), title: p.payer }), tx));
+    return li;
+  }));
+  printing.clear();
+}
+
+// The live block counter under the slot.
+async function chain() {
+  const hs = await (await fetch('/api/chain')).json();
+  const h = hs.find(x => !testnets.has(x.network)) || hs[0];
+  if (!h) { $('head').hidden = true; return; }
+  $('headNet').textContent = nets[h.network] || h.network;
+  $('headBlock').textContent = fmtBlock(h.block);
+  $('head').hidden = false;
+}
+
+// The meter: the whole payment record so far. Our own test wallets are
+// counted apart and said so openly.
+async function flow() {
+  const st = await (await fetch('/api/stats')).json();
+  if (st.since) $('countsTitle').textContent = 'All payments since ' + new Date(st.since).toLocaleDateString([], { day: 'numeric', month: 'short', year: 'numeric' });
+  const n = v => Math.round(v).toLocaleString('en-US');
+  const secs = v => v < 10 ? v.toFixed(1) + ' s' : Math.round(v) + ' s';
+  const row = (v, label, cls) => el('li', { className: cls || '' }, el('span', { textContent: label }), el('b', { textContent: v }));
+  $('flow').replaceChildren(
+    row(n(st.answered), 'Paid requests answered'),
+    row(n(st.settled), 'Settled on chain', 'settled'),
+    row(n(st.unpaid), 'Could not be settled'),
+    row(st.settled ? secs(st.settleSeconds) : 'n/a', 'Answer to settlement, median'),
+    row(n(st.otherPayers), 'Payers other than us'));
+  const note = $('ownNote');
+  if (st.ownPayers > 0) {
+    note.replaceChildren(st.otherPayers === 0
+      ? 'So far every payment is from our own test wallet, marked on the receipts. Yours would be the first.'
+      : 'Not counted above: our own test wallet, marked on the receipts.');
+    note.hidden = false;
+  } else note.hidden = true;
+}
+
+const safely = f => f().catch(() => {});
+safely(menu).then(() => safely(receipts));
+safely(flow); safely(chain);
+setInterval(() => { safely(receipts); safely(flow); }, 5000);
+setInterval(() => safely(chain), 2000);
+setInterval(() => safely(menu), 30000);
+</script>
+</body>
+</html>

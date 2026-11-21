@@ -1,0 +1,35 @@
+# The settlement provider and the prices for both test routes. PAYTO_ADDRESS is
+# a placeholder; substitute the receiving address when applying:
+#   sed "s/PAYTO_ADDRESS/$PAYTO_ADDRESS/" hack/dev-cluster/policies.yaml | kubectl apply -f -
+apiVersion: apivend.io/v1alpha1
+kind: SettlementProvider
+metadata: { name: default }
+spec:
+  backends:
+    - { type: facilitator, url: "https://x402.org/facilitator", priority: 1 }
+---
+# "/" settles after the response (async).
+apiVersion: apivend.io/v1alpha1
+kind: PaymentPolicy
+metadata: { name: search, namespace: prod }
+spec:
+  targetRef: { group: gateway.networking.k8s.io, kind: HTTPRoute, name: search }
+  description: Search API
+  price: { amount: "0.01", currency: USD }
+  accepts:
+    - { network: base-sepolia, asset: USDC, payTo: "PAYTO_ADDRESS" }
+  settlement: { mode: async, providerRef: { name: default }, maxUnsettledPerPayer: "1.00" }
+  risk: { freshness: 5s, onStateUnavailable: deny }
+---
+# "/sync" settles before the response is released.
+apiVersion: apivend.io/v1alpha1
+kind: PaymentPolicy
+metadata: { name: search-sync, namespace: prod }
+spec:
+  targetRef: { group: gateway.networking.k8s.io, kind: HTTPRoute, name: search-sync }
+  description: Search API, settled before the response
+  price: { amount: "0.01", currency: USD }
+  accepts:
+    - { network: base-sepolia, asset: USDC, payTo: "PAYTO_ADDRESS" }
+  settlement: { mode: sync, providerRef: { name: default }, maxUnsettledPerPayer: "1.00" }
+  risk: { freshness: 5s, onStateUnavailable: deny }

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Fast local checks before a push, so a formatting or vet slip costs seconds
+# instead of a CI round. Install once per clone: make hooks
+# Skip with: git push --no-verify
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+go=$(command -v go || true)
+[ -z "$go" ] && [ -x "$HOME/.local/go/bin/go" ] && go=$HOME/.local/go/bin/go
+if [ -z "$go" ]; then echo "pre-push: go not found, skipping checks" >&2; exit 0; fi
+gofmt=$("$go" env GOROOT)/bin/gofmt
+
+unformatted=$("$gofmt" -l $(git ls-files '*.go'))
+if [ -n "$unformatted" ]; then
+  echo "pre-push: not gofmt'd (run gofmt -w):" >&2; echo "$unformatted" >&2; exit 1
+fi
+"$go" vet ./...

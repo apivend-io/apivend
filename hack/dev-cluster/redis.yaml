@@ -1,0 +1,36 @@
+# Redis for the gateway: AOF on, no eviction (it holds unsettled payments).
+apiVersion: v1
+kind: Namespace
+metadata: { name: x402-system }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: redis-data, namespace: x402-system }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: redis, namespace: x402-system }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: redis } }
+  template:
+    metadata: { labels: { app: redis } }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          args: ["--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+          ports: [{ containerPort: 6379 }]
+          volumeMounts: [{ name: data, mountPath: /data }]
+      volumes: [{ name: data, persistentVolumeClaim: { claimName: redis-data } }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: redis, namespace: x402-system }
+spec:
+  selector: { app: redis }
+  ports: [{ port: 6379 }]

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-label="Apivend">
+  <rect width="120" height="120" rx="22" fill="#0E1116"/>
+  <path d="M42 26H26v68h16" fill="none" stroke="#F6F7F9" stroke-width="11" stroke-linecap="square" stroke-linejoin="miter"/>
+  <path d="M78 26h16v68H78" fill="none" stroke="#F6F7F9" stroke-width="11" stroke-linecap="square" stroke-linejoin="miter"/>
+  <circle cx="60" cy="60" r="18" fill="#F2B03D"/>
+</svg>

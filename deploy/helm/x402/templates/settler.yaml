@@ -1,0 +1,119 @@
+# The settler reads its providers (facilitators and their credentials,
+# written by the controller) from the x402-providers Secret through the API,
+# so a SettlementProvider change applies within about a second. A mounted
+# Secret is refreshed by the kubelet on its own schedule (about 90 s seen).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: x402-settler
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: x402-settler
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+rules:
+  # One object, read-only (resourceNames applies to list and watch because
+  # the settler selects the object by name).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["x402-providers"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: x402-settler
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: x402-settler
+subjects:
+  - kind: ServiceAccount
+    name: x402-settler
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: x402-settler
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+    app.kubernetes.io/component: settler
+spec:
+  replicas: {{ .Values.settler.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: settler
+  template:
+    metadata:
+      labels:
+        {{- include "x402.labels" . | nindent 8 }}
+        app.kubernetes.io/component: settler
+      {{- if .Values.metrics.annotations }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9103"
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: x402-settler
+      {{- include "x402.podSecurity" . | nindent 6 }}
+      # Let in-flight settlements finish on shutdown.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: settler
+          image: {{ include "x402.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/x402-settler"]
+          args:
+            - -metrics=:9103
+            - -providers-secret=x402-providers   # written by the controller
+            - -workers={{ .Values.settler.workers }}
+            - -max-attempts={{ .Values.settler.maxAttempts }}
+            - -block-payer-for={{ .Values.settler.blockPayerFor }}
+            {{- with .Values.settler.batchClaims.keySecret.name }}
+            - -batch-authorizer-key=/var/run/x402-claims/{{ $.Values.settler.batchClaims.keySecret.key }}
+            - -claim-interval={{ $.Values.settler.batchClaims.interval }}
+            - -claim-min-amount={{ $.Values.settler.batchClaims.minAmount }}
+            {{- end }}
+            {{- include "x402.rpcArgs" . | nindent 12 }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            {{- include "x402.redisEnv" . | nindent 12 }}
+            {{- include "x402.rpcEnv" . | nindent 12 }}
+            {{- if .Values.postgres.existingSecret.name }}
+            - name: X402_POSTGRES
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.existingSecret.name }}
+                  key: {{ .Values.postgres.existingSecret.key }}
+            {{- end }}
+          ports:
+            - { name: metrics, containerPort: 9103 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: metrics }
+          {{- include "x402.containerSecurity" . | nindent 10 }}
+          {{- with .Values.settler.batchClaims.keySecret.name }}
+          volumeMounts:
+            - { name: claim-key, mountPath: /var/run/x402-claims, readOnly: true }
+          {{- end }}
+          resources:
+            {{- toYaml .Values.settler.resources | nindent 12 }}
+      {{- with .Values.settler.batchClaims.keySecret.name }}
+      volumes:
+        - name: claim-key
+          # Readable by the non-root user (no fsGroup); the settler is the
+          # only process in the container.
+          secret: { secretName: {{ . }}, defaultMode: 0444 }
+      {{- end }}

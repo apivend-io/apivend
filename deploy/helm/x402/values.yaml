@@ -1,0 +1,122 @@
+# Installed and upgraded on k3s with these defaults plus redis.url.
+
+image:
+  repository: ghcr.io/apivend-io/gateway
+  tag: ""                            # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# Redis shared by the filter and the settler. A single Redis (or a primary with
+# replicas); Redis Cluster is not supported. Give either a URL or a Secret.
+redis:
+  url: ""                  # e.g. redis://redis.x402-system.svc:6379/0
+  existingSecret:
+    name: ""
+    key: url
+
+# PostgreSQL for receipts (settler only). Optional: without it receipts go to
+# the settler's log.
+postgres:
+  existingSecret:
+    name: ""
+    key: dsn
+
+# Chain RPC endpoints, per network. Without one for a network, payer balances
+# are not checked there and settlements cannot be confirmed on-chain.
+# Provider URLs embed API keys, so they come from a Secret:
+#   rpc:
+#     - network: base
+#       secretName: x402-rpc
+#       secretKey: base        # value: "https://a.example/KEY,https://b.example/KEY"
+rpc: []
+
+# Hosted payer-state service as the filter's preferred state source. The rpc
+# entries above then act as the fallback: if the hosted service is unreachable
+# the gateway carries on from RPC. Without any rpc entry, an outage of the
+# hosted service means priced requests are refused.
+hostedState:
+  url: ""                  # e.g. https://state.example.dev, or http://x402-state:9443 in-cluster
+  existingSecret:          # holds the API key
+    name: ""
+    key: api-key
+
+filter:
+  replicas: 2
+  # Blocks a balance increase must age before it counts (direct RPC source).
+  creditConfirmations: 0
+  minValidityRemaining: 10s
+  # Budget for a new payer's balance read, across all state sources. One
+  # read is 40-80 ms against public Base Sepolia RPCs from Europe.
+  chainReadTimeout: 300ms
+  resources: {}
+
+settler:
+  replicas: 1
+  workers: 4
+  maxAttempts: 4
+  blockPayerFor: 1h
+  # Batch settlement: our claim key (receiver authorizer) from a Secret you
+  # create; its address goes to controller.batch.receiverAuthorizer. It only
+  # signs claims (to the seller) and refunds (to the payer); it holds no funds.
+  batchClaims:
+    keySecret: { name: "", key: claim-key }
+    interval: 5m
+    minAmount: "100000"   # atomic units (0.10 USDC)
+  resources: {}
+
+controller:
+  enabled: true
+  # ext_proc message timeout the controller sets on every priced route. Must
+  # exceed filter.chainReadTimeout plus the filter's own work, or a payer the
+  # gateway has not seen yet gets a 504. Sync routes get at least 12s.
+  messageTimeout: 1s
+  # Batch settlement (payment channels): the address of our claim key, which
+  # the settler holds. Empty: policies may not offer batch-settlement.
+  batch:
+    receiverAuthorizer: ""
+    withdrawDelay: 86400
+  resources: {}
+
+# Adds prometheus.io/* scrape annotations to the pods.
+metrics:
+  annotations: true
+
+# The public demo page (x402-demo).
+demo:
+  enabled: false
+  # - name: balance
+  #   url: https://demo.example.dev/v1/balance
+  #   note: Balance of any wallet, with the block it was read at.
+  #   key: demo/balance        # the HTTPRoute, to name rows in the payment feed
+  routes: []
+  # Show route prices from the controller's price table (x402-routes in this
+  # namespace): exact, live, and no unpaid requests to the routes. Routes then
+  # need their "key" (the PaymentPolicy's namespace/name). Off: each route is
+  # checked over HTTP instead, optionally through probeVia.
+  priceTable: true
+  # Your own test wallets: the page labels their receipts and counts payers
+  # other than them, so visitors see openly who has paid so far.
+  ownPayers: []
+  # Send the HTTP check through this URL (the gateway's in-cluster Service)
+  # instead of the public URLs, e.g. when an access gate sits in front.
+  probeVia: ""
+  # The latest block of one network, shown live on the page. RPC URLs come
+  # from a Secret (comma-separated, like rpc: above); never logged.
+  chainHead:
+    network: ""          # CAIP-2, e.g. eip155:8453
+    secretName: ""
+    secretKey: ""
+  # Also serve the demo's own priced service (/v1/balance, /v1/hello) on port
+  # 8091. /v1/balance asks the hosted payer-state service.
+  backend:
+    enabled: false
+    stateURL: http://x402-state:8080
+    stateKeySecret:
+      name: ""
+      key: api-key
+  # Read-only PostgreSQL role for the receipts feed.
+  postgres:
+    existingSecret:
+      name: ""
+      key: dsn
+  resources: {}

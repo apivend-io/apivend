@@ -1,0 +1,9 @@
+# Example settlement providers for x402-settler, standalone. Mirrors the
+# SettlementProvider resource. Backends are tried in priority order.
+providers:
+  - name: default
+    backends:
+      - type: facilitator
+        url: https://x402.org/facilitator   # public testnet facilitator; replace for production
+        # credentialsFile: /etc/x402/secrets/facilitator-token   # bearer token, optional
+        priority: 1

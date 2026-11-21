@@ -1,0 +1,57 @@
+# Example price table for x402-filter, standalone. Field names follow the
+# PaymentPolicy resource; on Kubernetes the controller generates this table
+# from PaymentPolicies.
+routes:
+  - name: search
+    description: Search API
+    mimeType: application/json
+    match:
+      pathPrefix: /search
+      # hosts: [api.example.com]   # optional; empty matches any host
+    price:
+      amount: "0.01"
+      currency: USD
+    accepts:
+      - network: base-sepolia      # or: base
+        asset: USDC
+        # Replace with the address that should receive payments.
+        payTo: "0x209693Bc6afc0C5328bA36FaF03C514EF312287C"
+    maxTimeoutSeconds: 60
+    settlement:
+      mode: async
+      providerRef:
+        name: default
+      # What one payer may have in flight plus served-but-unsettled.
+      maxUnsettledPerPayer: "1.00"
+    risk:
+      freshness: 5s
+      onStateUnavailable: deny     # or: allow
+
+  # Priced by Envoy route name instead of path: everything the HTTPRoute
+  # "maps" in namespace "demo" serves. This is what the controller generates.
+  - name: maps
+    match:
+      envoyRoutePrefix: httproute/demo/maps/
+    price:
+      amount: "0.002"
+      currency: USD
+    accepts:
+      - network: base-sepolia
+        asset: USDC
+        payTo: "0x209693Bc6afc0C5328bA36FaF03C514EF312287C"
+
+  # Sync settlement: the response is held until the payment has settled, and
+  # PAYMENT-RESPONSE carries the real transaction hash.
+  - name: reports
+    match:
+      pathPrefix: /reports
+    price:
+      amount: "0.25"
+      currency: USD
+    accepts:
+      - network: base-sepolia
+        asset: USDC
+        payTo: "0x209693Bc6afc0C5328bA36FaF03C514EF312287C"
+    settlement:
+      mode: sync
+      syncTimeout: 10s

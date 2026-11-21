@@ -1,0 +1,11 @@
+{
+  "name": "x402-gateway-compat",
+  "private": true,
+  "type": "module",
+  "description": "Runs reference x402 clients against the gateway. Versions are pinned: the compatibility table in docs/COMPATIBILITY.md names them.",
+  "dependencies": {
+    "@x402/evm": "2.31.0",
+    "@x402/fetch": "2.31.0",
+    "viem": "2.58.0"
+  }
+}

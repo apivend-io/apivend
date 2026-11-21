@@ -1,0 +1,112 @@
+# Prometheus alerting rules for x402-filter and x402-settler.
+# Thresholds are starting points; tune them to the route's volume.
+groups:
+  - name: x402
+    rules:
+      # This one loses money: a served request whose payment authorization
+      # is about to expire without having been settled.
+      - alert: X402SettlementDeadlineNear
+        expr: x402_settlement_queue_earliest_deadline_seconds < 15
+        for: 10s
+        labels: { severity: critical }
+        annotations:
+          summary: A queued settlement is about to expire
+          description: >-
+            The most urgent queued authorization expires in {{ $value | humanizeDuration }}.
+            Check settler health and the settlement providers.
+
+      # Direct settlement (our own gas key) stops when the key runs dry, and
+      # every payment then waits for a facilitator, or expires. 0.0005 ETH is
+      # several hundred Base settlements (about 86k gas each); raise it with
+      # volume.
+      - alert: X402GasBalanceLow
+        expr: x402_settle_gas_balance_wei < 5e14
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: Direct-settlement gas key is running low
+          description: >-
+            The gas key of provider {{ $labels.provider }} on {{ $labels.network }} holds
+            {{ $value | humanize }} wei. Fund it before direct settlement stops.
+
+      - alert: X402PaymentsUnpaid
+        expr: sum by (route, reason) (increase(x402_payments_finished_total{status="unpaid"}[10m])) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: Served requests could not be settled on {{ $labels.route }}
+          description: "{{ $value }} request(s) in 10m ended unpaid: {{ $labels.reason }}."
+
+      - alert: X402CommitFailed
+        expr: sum by (route) (increase(x402_requests_total{decision="commit_failed"}[10m])) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: Served requests were not queued for settlement on {{ $labels.route }}
+          description: The backend answered 2xx but the reservation could not be committed. Check Redis.
+
+      - alert: X402SettlementFailureRate
+        expr: |
+          sum by (provider) (rate(x402_settle_attempt_seconds_count{outcome=~"refused|unavailable"}[5m]))
+            / sum by (provider) (rate(x402_settle_attempt_seconds_count[5m])) > 0.2
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Settlement provider {{ $labels.provider }} is failing
+          description: "{{ $value | humanizePercentage }} of settlement attempts fail."
+
+      - alert: X402QueueUnreadable
+        expr: x402_settlement_queue_up == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: The settler cannot read the settlement queue
+
+      - alert: X402SettlementBacklog
+        expr: x402_settlement_queue_depth > 100
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Settlement is not keeping up ({{ $value }} queued)
+
+      # Money at risk in async mode. Set the threshold from your own
+      # maxUnsettledPerPayer and payer count (USDC: 1e6 atomic units = 1 USD).
+      - alert: X402UnsettledExposureHigh
+        expr: sum by (route) (x402_unsettled_atomic) > 50e6
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Unsettled exposure on {{ $labels.route }} is high
+
+      - alert: X402PayerStateUnavailable
+        expr: sum by (route) (rate(x402_requests_total{decision=~"unavailable|served_unpaid"}[5m])) > 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: Payer state is unavailable on {{ $labels.route }}
+          description: Requests are being refused (or served unpaid, per route policy). Check Redis and the chain RPC.
+
+      - alert: X402ChainReadsFailing
+        expr: |
+          sum by (network) (rate(x402_chain_read_seconds_count{result="error"}[5m]))
+            / sum by (network) (rate(x402_chain_read_seconds_count[5m])) > 0.1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Balance reads on {{ $labels.network }} are failing
+
+      # Usually a client compatibility break: challenges go out, nobody pays.
+      - alert: X402ConversionDrop
+        expr: |
+          sum by (route) (rate(x402_requests_total{decision="reserved"}[15m]))
+            / sum by (route) (rate(x402_requests_total{decision="challenged"}[15m])) < 0.1
+          and sum by (route) (rate(x402_requests_total{decision="challenged"}[15m])) > 0.1
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: Few challenged clients on {{ $labels.route }} go on to pay
+
+      - alert: X402FilterSlow
+        expr: histogram_quantile(0.99, sum by (le) (rate(x402_filter_request_seconds_bucket[5m]))) > 0.1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: The filter is using more than half of Envoy's ext_proc budget at p99

@@ -1,0 +1,170 @@
+{{- if .Values.demo.enabled }}
+{{- if .Values.demo.priceTable }}
+# The demo reads route prices from the controller's price table: one object,
+# read-only, as for the filter.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: x402-demo
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: x402-demo
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["x402-routes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: x402-demo
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: x402-demo
+subjects:
+  - kind: ServiceAccount
+    name: x402-demo
+    namespace: {{ .Release.Namespace }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: x402-demo
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+    app.kubernetes.io/component: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: demo
+  template:
+    metadata:
+      labels:
+        {{- include "x402.labels" . | nindent 8 }}
+        app.kubernetes.io/component: demo
+    spec:
+      {{- if .Values.demo.priceTable }}
+      serviceAccountName: x402-demo
+      {{- else }}
+      automountServiceAccountToken: false
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "x402.podSecurity" . | nindent 6 }}
+      containers:
+        - name: demo
+          image: {{ include "x402.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/x402-demo"]
+          args:
+            - -listen=:8090
+            {{- if .Values.demo.backend.enabled }}
+            - -backend=:8091
+            - -state-url={{ .Values.demo.backend.stateURL }}
+            {{- end }}
+            {{- if .Values.demo.priceTable }}
+            - -price-configmap=x402-routes
+            {{- end }}
+            {{- with .Values.demo.routes }}
+            - {{ printf "-routes-json=%s" (toJson .) | quote }}
+            {{- end }}
+            {{- with .Values.demo.probeVia }}
+            - -probe-via={{ . }}
+            {{- end }}
+            {{- with .Values.demo.chainHead.network }}
+            - -chain-head={{ . }}
+            {{- end }}
+            {{- with .Values.demo.ownPayers }}
+            - -own-payers={{ join "," . }}
+            {{- end }}
+          env:
+            {{- if .Values.demo.priceTable }}
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            {{- end }}
+            {{- if .Values.demo.postgres.existingSecret.name }}
+            - name: X402_POSTGRES
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.demo.postgres.existingSecret.name }}
+                  key: {{ .Values.demo.postgres.existingSecret.key }}
+            {{- end }}
+            {{- if .Values.demo.chainHead.network }}
+            - name: X402_HEAD_RPC
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "demo.chainHead.secretName is required" .Values.demo.chainHead.secretName }}
+                  key: {{ required "demo.chainHead.secretKey is required" .Values.demo.chainHead.secretKey }}
+            {{- end }}
+            {{- if .Values.demo.backend.enabled }}
+            - name: X402_HOSTED_STATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "demo.backend.stateKeySecret.name is required" .Values.demo.backend.stateKeySecret.name }}
+                  key: {{ .Values.demo.backend.stateKeySecret.key }}
+            {{- end }}
+          ports:
+            - { name: http, containerPort: 8090 }
+            - { name: backend, containerPort: 8091 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+          {{- include "x402.containerSecurity" . | nindent 10 }}
+          resources:
+            {{- toYaml .Values.demo.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: x402-demo
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+    app.kubernetes.io/component: demo
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: demo
+  ports:
+    - { name: http, port: 8090, targetPort: http }
+    - { name: backend, port: 8091, targetPort: backend }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: x402-filter-metrics
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: filter
+  ports:
+    - { name: metrics, port: 9102, targetPort: metrics }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: x402-settler-metrics
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: settler
+  ports:
+    - { name: metrics, port: 9103, targetPort: metrics }
+{{- end }}

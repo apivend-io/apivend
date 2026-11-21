@@ -1,0 +1,60 @@
+# A SettlementProvider (cluster-scoped) and a PaymentPolicy pricing the
+# HTTPRoute "search" in namespace "prod" at one cent per request.
+apiVersion: apivend.io/v1alpha1
+kind: SettlementProvider
+metadata:
+  name: default
+spec:
+  backends:
+    - type: facilitator
+      url: https://x402.org/facilitator
+      # credentialsRef:        # Secret in the x402 namespace, key "token"
+      #   name: fac-key
+      priority: 1
+    # Optional last resort: settle yourself. The settler submits the
+    # transfer through its own -rpc endpoints; the key in the Secret pays gas
+    # only (fund it with a little ETH). No compliance screening.
+    # - type: direct
+    #   credentialsRef: { name: gas-key, key: key }
+    #   maxFee: "0.00002"   # ETH, most gas one settlement may cost
+    #   priority: 9
+---
+apiVersion: apivend.io/v1alpha1
+kind: PaymentPolicy
+metadata:
+  name: search
+  namespace: prod
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: search
+  description: Search API
+  price:
+    amount: "0.01"
+    currency: USD
+  accepts:
+    - network: base-sepolia
+      asset: USDC
+      payTo: "0x209693Bc6afc0C5328bA36FaF03C514EF312287C"   # replace
+  settlement:
+    mode: async
+    providerRef:
+      name: default
+    maxUnsettledPerPayer: "1.00"
+  risk:
+    freshness: 5s
+    onStateUnavailable: deny
+  # Optional: describe the route for x402 catalogues and agents (the bazaar
+  # discovery extension). With enabled: true the 402 carries it, and
+  # facilitators that index resources list the route; CDP's Bazaar does so
+  # after the first settled payment, with no review step. The description
+  # above is shown with it (at most 500 characters).
+  discovery:
+    enabled: false
+    serviceName: Search
+    tags: [search, web]
+    queryParams:
+      - { name: q, required: true, example: "x402 gateway", description: "What to search for" }
+    output:
+      example: { results: [{ title: "Example", url: "https://example.com/" }] }

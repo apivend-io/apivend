@@ -1,0 +1,88 @@
+// The hosted payer-state service: chain facts for x402 gateways.
+//
+// It supplies balances and authorization events only. Reservations, replay
+// tracking and settlement stay in the gateway.
+//
+// Authentication: an API key in the "authorization: Bearer <key>" metadata.
+// Every answer carries the block it is based on, so it can be spot-checked
+// against any other node.
+syntax = "proto3";
+
+package x402.state.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "apivend.io/apivend/api/statepb;statepb";
+
+service PayerState {
+  // Snapshot returns the latest known state of one payer and starts tracking it.
+  rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+  // AuthorizationState reports whether an EIP-3009 nonce is unused, used or cancelled.
+  rpc AuthorizationState(AuthorizationStateRequest) returns (AuthorizationStateResponse);
+  // Watch streams updates for the payers the client names. The first request
+  // sets chain and asset; every request adds payers, and re-sending a payer
+  // keeps it watched. The service stops watching payers it is not reminded of.
+  rpc Watch(stream WatchRequest) returns (stream WatchResponse);
+}
+
+// Observation says what an answer is based on.
+message Observation {
+  uint64 block_height = 1;
+  string block_hash = 2;
+  google.protobuf.Timestamp observed_at = 3;
+  // Which upstream node source produced the data.
+  string provider = 4;
+}
+
+message SnapshotRequest {
+  string chain = 1; // CAIP-2, e.g. "eip155:8453"
+  string asset = 2; // token contract address
+  string payer = 3;
+}
+
+message SnapshotResponse {
+  string balance = 1; // atomic units, decimal
+  Observation observation = 2;
+}
+
+message AuthorizationStateRequest {
+  string chain = 1;
+  string asset = 2;
+  string payer = 3;
+  string nonce = 4; // 0x + 64 hex
+}
+
+enum AuthState {
+  AUTH_STATE_UNSPECIFIED = 0;
+  AUTH_STATE_UNUSED = 1;
+  // Used, or cancelled when the service only has the contract's answer.
+  AUTH_STATE_USED = 2;
+  AUTH_STATE_CANCELED = 3;
+}
+
+message AuthorizationStateResponse {
+  AuthState state = 1;
+  Observation observation = 2;
+}
+
+message WatchRequest {
+  string chain = 1;
+  string asset = 2;
+  repeated string payers = 3;
+}
+
+message WatchResponse {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_BALANCE = 1;
+    KIND_AUTH_USED = 2;
+    KIND_AUTH_CANCELED = 3;
+  }
+  Kind kind = 1;
+  string chain = 2;
+  string asset = 3;
+  string payer = 4;
+  string nonce = 5;   // auth events
+  string balance = 6; // balance events
+  Observation observation = 7;
+}

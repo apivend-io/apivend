@@ -1,0 +1,135 @@
+{{- if .Values.controller.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: x402-controller
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Namespace }}-x402-controller
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apivend.io"]
+    resources: ["paymentpolicies", "settlementproviders"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apivend.io"]
+    resources: ["paymentpolicies/status", "settlementproviders/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.envoyproxy.io"]
+    resources: ["envoyextensionpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Namespace }}-x402-controller
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Namespace }}-x402-controller
+subjects:
+  - kind: ServiceAccount
+    name: x402-controller
+    namespace: {{ .Release.Namespace }}
+---
+# Config, credentials and leader election stay inside the release namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: x402-controller
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["referencegrants"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: x402-controller
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: x402-controller
+subjects:
+  - kind: ServiceAccount
+    name: x402-controller
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: x402-controller
+  labels:
+    {{- include "x402.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        {{- include "x402.labels" . | nindent 8 }}
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: x402-controller
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "x402.podSecurity" . | nindent 6 }}
+      containers:
+        - name: controller
+          image: {{ include "x402.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/x402-controller"]
+          args:
+            - -filter-service=x402-filter
+            - -filter-port=9002
+            - -routes-configmap=x402-routes
+            - -providers-secret=x402-providers
+            - -message-timeout={{ .Values.controller.messageTimeout }}
+            {{- with .Values.controller.batch.receiverAuthorizer }}
+            - -batch-receiver-authorizer={{ . }}
+            - -batch-withdraw-delay={{ $.Values.controller.batch.withdrawDelay }}
+            {{- end }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - { name: metrics, containerPort: 9104 }
+            - { name: health, containerPort: 9105 }
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+          livenessProbe:
+            httpGet: { path: /healthz, port: health }
+          {{- include "x402.containerSecurity" . | nindent 10 }}
+          resources:
+            {{- toYaml .Values.controller.resources | nindent 12 }}
+{{- end }}

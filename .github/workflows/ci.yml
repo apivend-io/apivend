@@ -1,0 +1,148 @@
+# Every pull request, and pushes to main. No secrets: nothing here touches a
+# real chain, a facilitator or a key worth anything.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Go tests (real Redis and PostgreSQL)
+    runs-on: ubuntu-24.04
+    env:
+      # A missing Redis or PostgreSQL fails the payment-path tests instead
+      # of skipping them.
+      X402_REQUIRE_TEST_SERVERS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install Redis (PostgreSQL ships with the runner image)
+        run: |
+          command -v redis-server >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq redis-server; }
+          ls -d /usr/lib/postgresql/*/bin
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "not gofmt'd:"; echo "$unformatted"; exit 1; fi
+      - name: go vet
+        run: go vet ./...
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+  generated:
+    name: Generated code is up to date
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: make manifests
+        run: make manifests
+      - name: No diff
+        run: git diff --exit-code -- api deploy
+
+  licences:
+    name: Dependency licences
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # Fails on any dependency whose licence is forbidden, restricted
+      # (copyleft) or unrecognised.
+      - name: go-licenses check
+        run: |
+          go run github.com/google/go-licenses@v1.6.0 check ./... \
+            --disallowed_types=forbidden,restricted,unknown \
+            --ignore apivend.io/apivend
+
+  helm:
+    name: Helm chart
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.22.1
+      - name: helm lint
+        run: helm lint deploy/helm/x402 --set redis.url=redis://redis:6379/0
+      - name: Render with defaults
+        run: helm template x402 deploy/helm/x402 --set redis.url=redis://redis:6379/0 > /dev/null
+
+  e2e:
+    name: End to end (real Envoy, x402 Foundation clients)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Redis
+        run: |
+          command -v redis-cli >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq redis-server redis-tools; }
+      - name: make e2e
+        run: make e2e
+
+  kind:
+    name: Kubernetes (kind + Envoy Gateway)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.22.1
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.27.0
+          wait: 120s
+      - name: Smoke test
+        run: hack/kind-smoke.sh chart-testing
+      - name: Cluster state on failure
+        if: failure()
+        run: |
+          kubectl get pods -A
+          kubectl -n prod get paymentpolicy -o yaml
+          kubectl -n x402-system logs deploy/x402-controller --tail=50 || true
+          kubectl -n x402-system logs deploy/x402-filter --tail=50 || true
+
+  dco:
+    name: Commits signed off (DCO)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Every commit has a Signed-off-by line from its author
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          missing=0
+          for c in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            author=$(git log -1 --format='%an <%ae>' "$c")
+            if ! git log -1 --format='%B' "$c" | grep -qF "Signed-off-by: $author"; then
+              echo "::error::$(git log -1 --format='%h %s' "$c") has no 'Signed-off-by: $author' (use git commit -s)"
+              missing=1
+            fi
+          done
+          exit $missing
