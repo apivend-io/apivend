@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"apivend.io/apivend/engine/evm"
 	"log/slog"
 	"net"
 	"os"
@@ -21,6 +20,7 @@ import (
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
+	"apivend.io/apivend/engine/evm"
 	"apivend.io/apivend/engine/payerstate"
 	"apivend.io/apivend/engine/statesource"
 	"apivend.io/apivend/internal/cliutil"

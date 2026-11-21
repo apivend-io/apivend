@@ -5,8 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
-	"apivend.io/apivend/engine/evm"
 	"io"
 	"log/slog"
 	"net"
@@ -16,11 +14,13 @@ import (
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 
 	"apivend.io/apivend/engine/chain"
+	"apivend.io/apivend/engine/evm"
 	"apivend.io/apivend/engine/payerstate"
 	"apivend.io/apivend/engine/statesource"
 	"apivend.io/apivend/internal/extproc"
