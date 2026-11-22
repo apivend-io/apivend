@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.3.0
+
+### Fixed
+
+- **Client headers in the gateway's namespaces reached the upstream.** A
+  client could send `X-Apivend-*` or `X-X402-*` headers (other than the
+  payer header, which the filter already replaced), and a backend that
+  trusts them would believe them. Every request the filter forwards now
+  loses them, along with a client's `X-Forwarded-Host` and anything from
+  Cloudflare Access in front of the gateway: every `Cf-Access-*` header and
+  its session cookies (other cookies are kept). Found by an outside tester
+  and an independent code review.
+- **A 503 for a payment that could not be verified** (the chain unreachable,
+  or contract-wallet checks over their budget, which is per filter replica)
+  now says when to try again: `Retry-After: 2`.
+- **Rollouts could drop requests.** Envoy keeps sending to a pod for a
+  moment after Kubernetes takes it out of its Service. The filter and the
+  demo now wait before stopping (`rolloutDrainSeconds`, default 5; on
+  Kubernetes 1.30 or newer, 0 turns it off).
+
+### Documentation
+
+- **Securing Redis** in `docs/install.md`: a user per role with Redis
+  ACLs, the URL from a Secret (`redis.existingSecret`), a memory ceiling
+  without eviction, persistence, a separate Redis for Envoy Gateway's rate
+  limiter, and a network policy.
+
 ## v0.2.0
 
 Most of this release comes from a security review of a production

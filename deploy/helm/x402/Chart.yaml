@@ -2,5 +2,5 @@ apiVersion: v2
 name: x402
 description: x402 payment policy for Envoy Gateway - filter, settler and controller
 type: application
-version: 0.2.0
-appVersion: "0.2.0"
+version: 0.3.0
+appVersion: "0.3.0"

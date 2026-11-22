@@ -41,9 +41,10 @@ type ChainChecker struct {
 	// PerSecond and Burst budget the RPC calls these checks make, across
 	// all payers: a junk signature from a fresh address costs one call
 	// each, and addresses are free. Past the budget a check answers
-	// ErrBusy (the payment is refused as unavailable, 503, and can be
-	// retried); ordinary payments, signed by the payer's own key, never
-	// come here. Defaults 10 a second, bursts of 20.
+	// ErrBusy (the payment is refused as unavailable, 503 with
+	// Retry-After); ordinary payments, signed by the payer's own key, never
+	// come here. Defaults 10 a second, bursts of 20. The budget is per
+	// process: with N filter replicas the gateway allows N times that.
 	PerSecond float64
 	Burst     int
 

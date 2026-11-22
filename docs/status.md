@@ -4,7 +4,7 @@ What has been tested, and against what. "Real" means the actual software ran
 in the test: a real Envoy, a real Redis, a real chain. A gap is listed as a
 gap.
 
-v0.2 has served and settled real payments on Base Sepolia and Base mainnet,
+v0.3 has served and settled real payments on Base Sepolia and Base mainnet,
 behind Envoy Gateway on Kubernetes. It has not run at volume.
 
 | Part | Tested against | Not yet tested |

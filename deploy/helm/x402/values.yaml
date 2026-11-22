@@ -40,6 +40,12 @@ hostedState:
     name: ""
     key: api-key
 
+# Seconds the filter and demo wait after Kubernetes takes them out of
+# their Service, before stopping: Envoy may still route to them for a
+# moment, and a rollout would otherwise drop those requests (seen as 502s).
+# Needs Kubernetes 1.30 or newer; 0 turns it off.
+rolloutDrainSeconds: 5
+
 filter:
   replicas: 2
   # Blocks a balance increase must age before it counts (direct RPC source).

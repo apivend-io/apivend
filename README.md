@@ -52,7 +52,7 @@ claimed in batches). See [docs/BATCH-SETTLEMENT.md](docs/BATCH-SETTLEMENT.md).
 
 ## Status
 
-**v0.2: early.** The gateway has served and settled real payments on Base
+**v0.3: early.** The gateway has served and settled real payments on Base
 Sepolia and on Base mainnet, behind Envoy Gateway on Kubernetes. It has not
 run at volume yet. What has been tested, and against what, is in
 [docs/status.md](docs/status.md).
@@ -67,7 +67,7 @@ On Kubernetes with Envoy Gateway, the Helm chart installs the filter, the
 settler and the controller:
 
 ```sh
-helm install x402 oci://ghcr.io/apivend-io/charts/x402 --version 0.2.0 \
+helm install x402 oci://ghcr.io/apivend-io/charts/x402 --version 0.3.0 \
   -n x402-system --create-namespace \
   --set redis.url=redis://redis.x402-system.svc:6379/0
 ```

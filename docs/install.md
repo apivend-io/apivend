@@ -40,7 +40,7 @@ kubectl -n x402-system create secret generic x402-rpc \
 ### 2. The chart
 
 ```sh
-helm install x402 oci://ghcr.io/apivend-io/charts/x402 --version 0.2.0 \
+helm install x402 oci://ghcr.io/apivend-io/charts/x402 --version 0.3.0 \
   -n x402-system \
   --set redis.url=redis://redis.x402-system.svc:6379/0 \
   --set 'rpc[0].network=base-sepolia' \
@@ -49,6 +49,8 @@ helm install x402 oci://ghcr.io/apivend-io/charts/x402 --version 0.2.0 \
 ```
 
 This installs the CRDs, two filter replicas, the settler and the controller.
+For production, give Redis a password and pass its URL through a Secret:
+see [Securing Redis](#securing-redis).
 For receipts, add `--set postgres.existingSecret.name=<secret>` with the DSN
 under the key `dsn`. Every setting is described in the chart's
 `values.yaml`.
@@ -153,6 +155,45 @@ skips the compliance screening some facilitators do.
 - **`discovery`**: describes the route for x402 directories and agents. Off
   until `enabled: true`; some directories list a route after its first
   settled payment, with no review.
+
+### Securing Redis
+
+Redis holds the payments in flight: the funds held while a request is
+served, the nonces already used, and the settlement queue. Anyone who can
+write to it can drop payments that were served but not settled, or replay
+one. Treat it as part of the payment path:
+
+- **A password, and a user per role.** The filter and settler need data
+  commands, Lua scripts and blocking list commands, nothing else. Backups
+  need only a snapshot. With Redis ACLs (here as an ACL file):
+
+  ```
+  user default off
+  user x402 on >long-random-password ~* &* +@all -@admin -@dangerous
+  user backup on >another-password +sync +psync +replconf +ping
+  ```
+
+  Put the URL in a Secret and point the chart at it, instead of
+  `--set redis.url`:
+
+  ```sh
+  kubectl -n x402-system create secret generic x402-redis \
+    --from-literal=url='redis://x402:long-random-password@redis.x402-system.svc:6379/0'
+  helm upgrade x402 ... --set redis.existingSecret.name=x402-redis
+  ```
+
+  Snapshots then use `redis-cli --user backup --rdb <file>`.
+- **A memory ceiling, never eviction.** Set `maxmemory` with
+  `maxmemory-policy noeviction`. Evicting a hold or a nonce would mean an
+  unpaid answer or a replay; refusing writes makes the filter refuse paid
+  requests instead (it fails closed).
+- **Persistence.** `appendonly yes` with `appendfsync everysec`: a restart
+  loses at most about a second.
+- **Its own instance.** If Envoy Gateway's global rate limiting uses Redis,
+  give it a separate one: its counters are disposable (eviction is fine
+  there), and its pods then never reach the payments.
+- **A network policy** that lets only the filter and settler pods (and your
+  backup job) connect.
 
 ## Watching it
 

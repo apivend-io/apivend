@@ -100,7 +100,7 @@ func (s *Server) decideVoucher(ctx context.Context, t *txn, hdr map[string]strin
 	t.voucher, t.hold = v, hold
 	s.log.Info("voucher reserved", "route", route.Name, "payer", v.Config.Payer.Hex(), "charged", hold.Charged.String(),
 		"price", v.Offer.Amount.String(), "network", v.Offer.Wire.Network)
-	return continueRequest(
+	return t.pass(
 		[]*corev3.HeaderValueOption{setHeader(HeaderPayer, v.Config.Payer.String())},
 		[]string{x402.HeaderPaymentSignature},
 	), metrics.DecisionReserved

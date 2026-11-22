@@ -70,6 +70,7 @@ spec:
         - name: demo
           image: {{ include "x402.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- include "x402.preStop" . | nindent 10 }}
           command: ["/usr/local/bin/x402-demo"]
           args:
             - -listen=:8090

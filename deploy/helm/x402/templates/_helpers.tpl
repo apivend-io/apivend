@@ -63,3 +63,17 @@ securityContext:
   capabilities:
     drop: ["ALL"]
 {{- end }}
+
+{{/* Envoy keeps sending to a pod for a moment after Kubernetes takes it
+out of the Service: wait before stopping, so a rollout drops no request
+(rolloutDrainSeconds; 0 turns it off). Kubernetes 1.30 or newer only:
+the sleep action does not exist before, and older clusters get no pause. */}}
+{{- define "x402.preStop" -}}
+{{- if and .Values.rolloutDrainSeconds (semverCompare ">=1.30-0" .Capabilities.KubeVersion.Version) }}
+{{- with .Values.rolloutDrainSeconds }}
+lifecycle:
+  preStop:
+    sleep: { seconds: {{ . }} }
+{{- end }}
+{{- end }}
+{{- end }}

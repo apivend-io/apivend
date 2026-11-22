@@ -760,8 +760,13 @@ func TestContractWalletPayments(t *testing.T) {
 				}
 				return
 			}
-			if ir := resp.GetImmediateResponse(); ir == nil || ir.Status.Code != tc.code {
+			ir := resp.GetImmediateResponse()
+			if ir == nil || ir.Status.Code != tc.code {
 				t.Fatalf("got %v, want %v", resp, tc.code)
+			}
+			// 503 says when to try again (outside tester's T1).
+			if tc.code == typev3.StatusCode_ServiceUnavailable && mutation(ir.Headers.SetHeaders)["retry-after"] == "" {
+				t.Fatal("503 without Retry-After")
 			}
 		})
 	}
@@ -849,4 +854,82 @@ func TestRejectedPolicyRouteIsRefused(t *testing.T) {
 	if _, err := pricing.Build(pricing.Config{Refuse: []string{"httproute/"}}); err == nil {
 		t.Fatal("a refuse prefix without namespace and name was accepted")
 	}
+}
+
+// Outside tester's N2 and N3: headers in the gateway's namespaces, a
+// client's X-Forwarded-Host and a Cloudflare Access session never reach
+// the upstream as the client sent them; other cookies and the origin
+// secret header (overwritten by Envoy) are left alone. Paid and free.
+func TestClientHeadersAreScrubbed(t *testing.T) {
+	c, state := setup(t)
+	spoof := []string{"x-apivend-tenant", "geo", "x-apivend-payer", "0xdead", "x-x402-whatever", "1",
+		"x-forwarded-host", "evil.example", "cf-access-jwt-assertion", "eyJ...", "x-apivend-secret", "fake",
+		"cookie", "a=1; CF_Authorization=eyJ.jwt; b=2"}
+	check := func(name string, resp *extprocv3.ProcessingResponse) {
+		t.Helper()
+		m := resp.GetRequestHeaders().GetResponse().GetHeaderMutation()
+		removed := map[string]bool{}
+		for _, h := range m.GetRemoveHeaders() {
+			removed[h] = true
+		}
+		for _, h := range []string{"x-apivend-tenant", "x-apivend-payer", "x-x402-whatever", "x-forwarded-host", "cf-access-jwt-assertion"} {
+			if !removed[h] {
+				t.Errorf("%s: %s kept", name, h)
+			}
+		}
+		if removed["x-apivend-secret"] {
+			t.Errorf("%s: the origin secret header removed (Envoy sets it)", name)
+		}
+		if got := mutation(m.GetSetHeaders())["cookie"]; got != "a=1; b=2" {
+			t.Errorf("%s: cookie = %q", name, got)
+		}
+	}
+	check("free", open(t, c).request("/healthz", spoof...))
+	sig := pay(t, challenge(t, open(t, c).request("/search"), 402))
+	e := open(t, c)
+	check("paid", e.request("/search", append([]string{"payment-signature", sig}, spoof...)...))
+	if e.response("200").GetResponseHeaders() == nil {
+		t.Fatal("paid request not committed")
+	}
+	state.expect(t, "commit")
+}
+
+// The reviewer's cases: every Cf-Access-* header (service-token
+// credentials, the user's email), the other Access cookies, cookie names
+// with padding, cookies split over several headers (HTTP/2), a cookie
+// header holding only the Access session, and a forged payer on a paid
+// request (overwritten).
+func TestScrubEdgeCases(t *testing.T) {
+	c, state := setup(t)
+	get := func(resp *extprocv3.ProcessingResponse) (map[string]bool, map[string]string) {
+		m := resp.GetRequestHeaders().GetResponse().GetHeaderMutation()
+		removed := map[string]bool{}
+		for _, h := range m.GetRemoveHeaders() {
+			removed[h] = true
+		}
+		return removed, mutation(m.GetSetHeaders())
+	}
+	removed, set := get(open(t, c).request("/healthz",
+		"cf-access-client-id", "id.access", "cf-access-client-secret", "s3cret", "cf-access-authenticated-user-email", "a@b.example",
+		"cookie", "a=1; CF_AppSession=x", "cookie", "CF_Authorization =jwt; b=2; cf_binding=y"))
+	for _, h := range []string{"cf-access-client-id", "cf-access-client-secret", "cf-access-authenticated-user-email"} {
+		if !removed[h] {
+			t.Errorf("%s kept", h)
+		}
+	}
+	if set["cookie"] != "a=1; b=2" || removed["cookie"] {
+		t.Errorf("split cookies: set %q, removed %v", set["cookie"], removed["cookie"])
+	}
+	removed, set = get(open(t, c).request("/healthz", "cookie", "CF_Authorization=jwt"))
+	if !removed["cookie"] || set["cookie"] != "" {
+		t.Errorf("access-only cookie: removed %v, set %q", removed["cookie"], set["cookie"])
+	}
+	sig := pay(t, challenge(t, open(t, c).request("/search"), 402))
+	e := open(t, c)
+	_, set = get(e.request("/search", "payment-signature", sig, "x-x402-payer", "0x000000000000000000000000000000000000dEaD"))
+	if set[extproc.HeaderPayer] == "" || strings.Contains(strings.ToLower(set[extproc.HeaderPayer]), "dead") {
+		t.Errorf("payer = %q", set[extproc.HeaderPayer])
+	}
+	e.response("200")
+	state.expect(t, "commit")
 }

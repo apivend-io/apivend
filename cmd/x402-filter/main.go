@@ -50,7 +50,7 @@ func main() {
 		hostedKeyFile   = flag.String("hosted-state-key-file", "", "file holding the hosted service API key (or env X402_HOSTED_STATE_KEY)")
 		rpcs            = cliutil.RPCFlag{}
 		factories       = flag.String("eip6492-factories", "", "comma-separated smart-wallet factories allowed to deploy an ERC-6492 wallet during verification (simulated only); default: Coinbase Smart Wallet v1.1 and v1")
-		contractRate    = flag.Float64("contract-wallet-checks-per-second", 10, "RPC calls a second that contract-wallet signature checks may make, across all payers (bursts of twice that); past it such payments get 503 and may retry. Payer-key signatures never use it")
+		contractRate    = flag.Float64("contract-wallet-checks-per-second", 10, "RPC calls a second that contract-wallet signature checks may make in this replica, across all payers (bursts of twice that); past it such payments get 503 and may retry. Payer-key signatures never use it")
 		contractTimeout = flag.Duration("contract-wallet-timeout", time.Second, "how long a contract-wallet signature check (EIP-1271 eth_call) may take; only payments whose signature is not the payer's own key wait on it")
 	)
 	flag.Var(rpcs, "rpc", "chain RPC endpoints as network=url[,url...]; repeatable. Networks without one get no balance checks")

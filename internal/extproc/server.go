@@ -99,7 +99,10 @@ func (s *Server) Table() *pricing.Table { return s.table.Load() }
 
 // txn is the per-request state; one ext_proc stream serves one HTTP request.
 type txn struct {
-	route       *pricing.Route
+	route *pricing.Route
+	// scrubSet and scrubRemove: what every passed request loses (scrub).
+	scrubSet    []*corev3.HeaderValueOption
+	scrubRemove []string
 	requestID   string
 	verifiedAt  time.Time
 	payload     *x402.PaymentPayload
@@ -186,6 +189,7 @@ func (s *Server) onRequestHeaders(ctx context.Context, t *txn, h *extprocv3.Http
 // decide handles request headers and names the decision it took.
 func (s *Server) decide(ctx context.Context, t *txn, h *extprocv3.HttpHeaders, envoyRoute string) (*extprocv3.ProcessingResponse, string) {
 	hdr := indexHeaders(h.GetHeaders())
+	t.scrubSet, t.scrubRemove = scrub(h.GetHeaders().GetHeaders())
 	route := s.table.Load().Match(hdr[":authority"], hdr[":path"], envoyRoute)
 	if route == nil && s.table.Load().Refused(envoyRoute) {
 		// Its PaymentPolicy exists but was rejected: fail closed until it
@@ -204,7 +208,7 @@ func (s *Server) decide(ctx context.Context, t *txn, h *extprocv3.HttpHeaders, e
 		}
 		// Not priced: pass it on, but never with a payer the client made up
 		// (the backend trusts this header on paid requests).
-		return continueRequest(nil, []string{HeaderPayer}), ""
+		return t.pass(nil, []string{HeaderPayer}), ""
 	}
 	// A CORS preflight carries no payment and must not be charged (HTTP
 	// transport spec, "Browser clients"). It is answered here and never
@@ -256,7 +260,7 @@ func (s *Server) decide(ctx context.Context, t *txn, h *extprocv3.HttpHeaders, e
 		}
 		if verr.Unavailable {
 			// Fail closed: the signature could not be checked.
-			return immediate(typev3.StatusCode_ServiceUnavailable, nil, []byte(`{"error":"payment verification unavailable"}`), "x402_verify_unavailable"), metrics.DecisionUnavailable
+			return immediate(typev3.StatusCode_ServiceUnavailable, []*corev3.HeaderValueOption{setHeader("retry-after", "2")}, []byte(`{"error":"payment verification unavailable"}`), "x402_verify_unavailable"), metrics.DecisionUnavailable
 		}
 		return s.challenge(route, resource, typev3.StatusCode_PaymentRequired, verr.Reason, "rejected"), metrics.DecisionRejected
 	}
@@ -297,7 +301,7 @@ func (s *Server) decide(ctx context.Context, t *txn, h *extprocv3.HttpHeaders, e
 			// The route prefers availability: serve without a reservation.
 			// Nothing will be settled for this request.
 			s.log.Warn("payer state unavailable; serving unpaid per route policy", "route", route.Name, "payer", payment.Payer.Hex(), "err", err)
-			return continueRequest(
+			return t.pass(
 				[]*corev3.HeaderValueOption{setHeader(HeaderPayer, payment.Payer.String())},
 				[]string{x402.HeaderPaymentSignature},
 			), metrics.DecisionUnpaid
@@ -320,7 +324,7 @@ func (s *Server) decide(ctx context.Context, t *txn, h *extprocv3.HttpHeaders, e
 		"network", payment.Offer.Wire.Network, "state_source", basis.Source, "state_block", basis.BlockHeight)
 
 	// The backend never sees the signed payment, only who paid.
-	return continueRequest(
+	return t.pass(
 		[]*corev3.HeaderValueOption{setHeader(HeaderPayer, payment.Payer.String())},
 		[]string{x402.HeaderPaymentSignature},
 	), metrics.DecisionReserved
@@ -631,6 +635,72 @@ func sanitizeList(v string) string {
 		}
 	}
 	return strings.Join(out, ", ")
+}
+
+// scrub lists what a request must not carry to the upstream, whatever the
+// client sent: headers in the gateway's own namespaces (X-Apivend-*,
+// X-X402-*), which a backend may trust, except those the gateway sets
+// itself (the payer, set or removed by the caller; the origin secret,
+// which Envoy's credential injection overwrites); X-Forwarded-Host; and
+// Cloudflare Access in front of the gateway (every Cf-Access-* header,
+// service-token credentials and the user's email included, and its session
+// cookies), which is ours, not the upstream's. Other cookies are kept.
+func scrub(hs []*corev3.HeaderValue) (set []*corev3.HeaderValueOption, remove []string) {
+	seen := map[string]bool{}
+	drop := func(k string) {
+		if !seen[k] {
+			seen[k] = true
+			remove = append(remove, k)
+		}
+	}
+	var cookies []string
+	access := false
+	for _, h := range hs {
+		k := strings.ToLower(h.GetKey())
+		v := h.GetValue()
+		if raw := h.GetRawValue(); len(raw) > 0 {
+			v = string(raw)
+		}
+		switch {
+		case strings.HasPrefix(k, "x-apivend-") && k != "x-apivend-secret",
+			strings.HasPrefix(k, "x-x402-") && k != HeaderPayer,
+			k == "x-forwarded-host", strings.HasPrefix(k, "cf-access-"):
+			drop(k)
+		case k == "cookie":
+			for _, c := range strings.Split(v, ";") {
+				c = strings.TrimSpace(c)
+				if name, _, _ := strings.Cut(c, "="); accessCookie(strings.TrimSpace(name)) {
+					access = true
+				} else if c != "" {
+					cookies = append(cookies, c)
+				}
+			}
+		}
+	}
+	if access {
+		drop("cookie")
+		if len(cookies) > 0 {
+			remove = remove[:len(remove)-1]
+			set = append(set, setHeader("cookie", strings.Join(cookies, "; ")))
+		}
+	}
+	return set, remove
+}
+
+// accessCookie: the cookies Cloudflare Access keeps its session in.
+func accessCookie(name string) bool {
+	for _, c := range []string{"CF_Authorization", "CF_AppSession", "CF_Binding"} {
+		if strings.EqualFold(name, c) {
+			return true
+		}
+	}
+	return false
+}
+
+// pass lets the request through with the caller's header changes and the
+// scrubbing every request gets.
+func (t *txn) pass(set []*corev3.HeaderValueOption, remove []string) *extprocv3.ProcessingResponse {
+	return continueRequest(append(set, t.scrubSet...), append(remove, t.scrubRemove...))
 }
 
 func continueRequest(set []*corev3.HeaderValueOption, remove []string) *extprocv3.ProcessingResponse {
