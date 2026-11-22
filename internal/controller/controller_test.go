@@ -138,6 +138,36 @@ func base() []client.Object {
 	}
 }
 
+// The controller's default per-route cap reaches async routes that set
+// none, never below their price; sync routes and explicit caps keep theirs.
+func TestDefaultMaxUnsettledPerRoute(t *testing.T) {
+	cheap := policy("prod", "search-price", "search", t0)
+	dear := policy("prod", "dear-price", "dear", t0)
+	dear.Spec.Price.Amount = "20"
+	dear.Spec.Settlement = &x402v1.Settlement{MaxUnsettledPerPayer: "50"}
+	sync := policy("prod", "sync-price", "sync", t0)
+	sync.Spec.Settlement = &x402v1.Settlement{Mode: "sync"}
+	own := policy("prod", "own-price", "own", t0)
+	own.Spec.Settlement = &x402v1.Settlement{MaxUnsettledPerRoute: "2"}
+	w := newWorld(t, append(base(), httpRoute("prod", "dear"), httpRoute("prod", "sync"), httpRoute("prod", "own"), cheap, dear, sync, own)...)
+	w.r.DefaultMaxUnsettledPerRoute = "5.00"
+	w.reconcile()
+	table := w.table()
+	for name, want := range map[string]string{"prod/search-price": "5000000", "prod/dear-price": "20000000", "prod/own-price": "2000000", "prod/sync-price": ""} {
+		r := table.Route(name)
+		if r == nil {
+			t.Fatalf("%s not in the table", name)
+		}
+		got := ""
+		if c := r.Offers[0].MaxUnsettledPerRoute; c != nil {
+			got = c.String()
+		}
+		if got != want {
+			t.Errorf("%s: cap %q, want %q", name, got, want)
+		}
+	}
+}
+
 func TestPolicyIsProgrammed(t *testing.T) {
 	p := policy("prod", "search-price", "search", t0)
 	p.Spec.Description = "Search API"
@@ -301,8 +331,48 @@ func TestRejections(t *testing.T) {
 	if n := w.table().Len(); n != 0 {
 		t.Fatalf("%d rejected policies reached the price table", n)
 	}
-	if w.extensionPolicy("prod", "x402-invalid") != nil {
-		t.Fatal("rejected policy got an EnvoyExtensionPolicy")
+	// A rejected policy's route is refused, not served free: the filter
+	// stays attached and the table lists the route.
+	if !w.table().Refused("httproute/prod/search/rule/0/match/0") {
+		t.Fatal("route of a rejected policy is not refused")
+	}
+	if w.extensionPolicy("prod", "x402-invalid") == nil {
+		t.Fatal("rejected policy's route lost the filter")
+	}
+	if w.table().Refused("httproute/prod/searching/rule/0/match/0") {
+		t.Fatal("refusal reaches a route that only shares a name prefix")
+	}
+	// Fixing it prices the route and lifts the refusal.
+	fixed := policy("prod", "invalid", "search", t0)
+	cur := &x402v1.PaymentPolicy{}
+	if err := w.c.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: "invalid"}, cur); err != nil {
+		t.Fatal(err)
+	}
+	cur.Spec = fixed.Spec
+	for _, n := range []string{"no-provider", "too-tight", "orphan"} {
+		o := &x402v1.PaymentPolicy{}
+		w.c.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: n}, o)
+		w.c.Delete(context.Background(), o)
+	}
+	if err := w.c.Update(context.Background(), cur); err != nil {
+		t.Fatal(err)
+	}
+	w.reconcile()
+	if w.table().Refused("httproute/prod/search/rule/0/match/0") || w.table().Match("h", "/", "httproute/prod/search/rule/0/match/0") == nil {
+		t.Fatal("fixed policy: route still refused or not priced")
+	}
+}
+
+// A policy whose target is not an HTTPRoute never refuses an HTTPRoute that
+// happens to share its name.
+func TestRejectedWrongKindRefusesNothing(t *testing.T) {
+	p := policy("prod", "wrong-kind", "search", t0)
+	p.Spec.TargetRef.Kind = "Service"
+	w := newWorld(t, append(base(), p)...)
+	w.reconcile()
+	w.accepted("prod", "wrong-kind", false, "Invalid")
+	if w.table().Refused("httproute/prod/search/rule/0/match/0") || w.extensionPolicy("prod", "x402-wrong-kind") != nil {
+		t.Fatal("a non-HTTPRoute policy refused an HTTPRoute")
 	}
 }
 
@@ -316,6 +386,9 @@ func TestOldestPolicyWinsARoute(t *testing.T) {
 
 	w.accepted("prod", "zz-first", true, "Accepted")
 	w.accepted("prod", "aa-second", false, "Conflicted")
+	if w.table().Refused("httproute/prod/search/rule/0/match/0") {
+		t.Fatal("a conflicting policy refused a route another policy prices")
+	}
 	if o := w.table().Match("h", "/", "httproute/prod/search/rule/0/match/0").Offers[0]; o.Wire.Amount != "10000" {
 		t.Fatalf("the newer policy repriced the route: %s", o.Wire.Amount)
 	}
@@ -391,6 +464,23 @@ func TestSyncPolicyRaisesMessageTimeout(t *testing.T) {
 // mainnet and testnet: a paid route never accepts testnet.
 var kindLine = regexp.MustCompile(`(?m)^kind: (\w+)\s*$`)
 
+var fluxVar = regexp.MustCompile(`\$\{([A-Z0-9_]+)\}`)
+
+func clusterVars(t *testing.T, name string) map[string]string {
+	t.Helper()
+	raw, err := os.ReadFile("../../demo/gitops/clusters/" + name + "/vars.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cm struct {
+		Data map[string]string `json:"data"`
+	}
+	if err := yaml.Unmarshal(raw, &cm); err != nil {
+		t.Fatal(err)
+	}
+	return cm.Data
+}
+
 func TestGitOpsPoliciesAreValid(t *testing.T) {
 	// Only where the clusters' layout is part of the tree.
 	if _, err := os.Stat("../../demo/gitops"); os.IsNotExist(err) {
@@ -405,11 +495,25 @@ func TestGitOpsPoliciesAreValid(t *testing.T) {
 	objs := []client.Object{}
 	routes, providers := map[string]bool{}, map[string]bool{}
 	var policies []*x402v1.PaymentPolicy
+	// Flux substitutes each cluster's vars (clusters/<name>/vars.yaml): read
+	// the policies as stage gets them, and check both clusters define
+	// every variable the manifests use.
+	stage := clusterVars(t, "stage")
+	prod := clusterVars(t, "production")
 	for _, f := range files {
 		raw, err := os.ReadFile(f)
 		if err != nil {
 			t.Fatal(err)
 		}
+		for _, m := range fluxVar.FindAllStringSubmatch(string(raw), -1) {
+			if _, ok := stage[m[1]]; !ok {
+				t.Errorf("%s: ${%s} not in clusters/stage/vars.yaml", f, m[1])
+			}
+			if _, ok := prod[m[1]]; !ok {
+				t.Errorf("%s: ${%s} not in clusters/production/vars.yaml", f, m[1])
+			}
+		}
+		raw = []byte(fluxVar.ReplaceAllStringFunc(string(raw), func(v string) string { return stage[fluxVar.FindStringSubmatch(v)[1]] }))
 		for i, doc := range strings.Split(string(raw), "\n---\n") {
 			kind := ""
 			if m := kindLine.FindStringSubmatch(doc); m != nil {

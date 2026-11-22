@@ -12,6 +12,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"path"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -38,6 +39,7 @@ const HeaderPayer = "x-x402-payer"
 
 // Server is the ext_proc gRPC service.
 type Server struct {
+	refuseUnpriced []string
 	extprocv3.UnimplementedExternalProcessorServer
 
 	table atomic.Pointer[pricing.Table]
@@ -63,10 +65,18 @@ type Options struct {
 	Contract verify.ContractChecker
 	// Channels, when set, accepts batch-settlement vouchers.
 	Channels *payerstate.Channels
+	// RefuseUnpriced lists patterns of Envoy route names that are always
+	// priced, matched segment by segment ("/"-separated, path.Match globs,
+	// a route name may have more segments): "httproute/t-*/p-*" is every
+	// route named p-* in a namespace t-*. A request on such a route that is
+	// not in the price table (its policy not loaded yet, or rejected) is
+	// refused, not passed on for free. Needs the filter attached to the
+	// whole listener.
+	RefuseUnpriced []string
 }
 
 func NewServer(table *pricing.Table, state payerstate.PayerState, o Options) *Server {
-	s := &Server{state: state, log: o.Logger, now: o.Now, m: o.Metrics, channels: o.Channels}
+	s := &Server{state: state, log: o.Logger, now: o.Now, m: o.Metrics, channels: o.Channels, refuseUnpriced: o.RefuseUnpriced}
 	if s.log == nil {
 		s.log = slog.Default()
 	}
@@ -177,10 +187,38 @@ func (s *Server) onRequestHeaders(ctx context.Context, t *txn, h *extprocv3.Http
 func (s *Server) decide(ctx context.Context, t *txn, h *extprocv3.HttpHeaders, envoyRoute string) (*extprocv3.ProcessingResponse, string) {
 	hdr := indexHeaders(h.GetHeaders())
 	route := s.table.Load().Match(hdr[":authority"], hdr[":path"], envoyRoute)
-	// CORS preflights carry no payment and must not be charged (HTTP
-	// transport spec, "Browser clients").
-	if route == nil || hdr[":method"] == "OPTIONS" {
-		return continueRequest(nil, nil), ""
+	if route == nil && s.table.Load().Refused(envoyRoute) {
+		// Its PaymentPolicy exists but was rejected: fail closed until it
+		// is fixed.
+		return immediate(typev3.StatusCode_ServiceUnavailable, nil,
+			[]byte(`{"error":"not_ready","message":"this endpoint's payment terms are not valid; try again later"}`), "x402_rejected_refused"), "refused"
+	}
+	if route == nil {
+		for _, p := range s.refuseUnpriced {
+			if routeMatches(p, envoyRoute) {
+				// A route that must be priced, without its prices: fail
+				// closed.
+				return immediate(typev3.StatusCode_ServiceUnavailable, nil,
+					[]byte(`{"error":"not_ready","message":"this endpoint's payment terms are not loaded; try again shortly"}`), "x402_unpriced_refused"), "refused"
+			}
+		}
+		// Not priced: pass it on, but never with a payer the client made up
+		// (the backend trusts this header on paid requests).
+		return continueRequest(nil, []string{HeaderPayer}), ""
+	}
+	// A CORS preflight carries no payment and must not be charged (HTTP
+	// transport spec, "Browser clients"). It is answered here and never
+	// forwarded: an upstream that ignores the method would otherwise serve
+	// its paid answer to an OPTIONS request for free. Any other OPTIONS is
+	// priced like every other method.
+	if hdr[":method"] == "OPTIONS" && hdr["origin"] != "" && hdr["access-control-request-method"] != "" {
+		return preflight(hdr), "preflight"
+	}
+	// A priced route is request and response. An upgrade (WebSocket) would
+	// answer 101, which releases the payment, and the connection would go
+	// on unpaid.
+	if hdr["upgrade"] != "" {
+		return immediate(typev3.StatusCode_BadRequest, nil, []byte(`{"error":"upgrade_not_supported","message":"connection upgrades are not supported on paid routes"}`), "x402_upgrade_refused"), "refused"
 	}
 	t.route = route
 
@@ -231,10 +269,12 @@ func (s *Server) decide(ctx context.Context, t *txn, h *extprocv3.HttpHeaders, e
 		Amount: payment.Auth.Value,
 		Expiry: payment.ValidBefore,
 		Policy: payerstate.Policy{
-			MaxUnsettled:       payment.Offer.MaxUnsettled,
-			Freshness:          route.Freshness,
-			AllowOnUnavailable: route.AllowOnUnavailable,
+			MaxUnsettled:         payment.Offer.MaxUnsettled,
+			MaxUnsettledPerRoute: payment.Offer.MaxUnsettledPerRoute,
+			Freshness:            route.Freshness,
+			AllowOnUnavailable:   route.AllowOnUnavailable,
 		},
+		Route: route.Name,
 	})
 	if err != nil {
 		var denied *payerstate.DeniedError
@@ -245,6 +285,12 @@ func (s *Server) decide(ctx context.Context, t *txn, h *extprocv3.HttpHeaders, e
 				reason = x402.ErrInsufficientFunds
 			}
 			s.m.Rejection(route.Name, reason)
+			if reason == payerstate.ReasonRouteExposureLimit {
+				// Not the payer's doing: the route has as much unsettled as
+				// it may until settlements catch up. Nothing was held.
+				return immediate(typev3.StatusCode_ServiceUnavailable, []*corev3.HeaderValueOption{setHeader("retry-after", "30")},
+					[]byte(`{"error":"this route is busy settling payments; try again shortly"}`), "x402_route_exposure_limit"), metrics.DecisionDenied
+			}
 			return s.challenge(route, resource, typev3.StatusCode_PaymentRequired, reason, "denied"), metrics.DecisionDenied
 		}
 		if route.AllowOnUnavailable {
@@ -330,11 +376,16 @@ func (s *Server) onResponseHeaders(ctx context.Context, t *txn, h *extprocv3.Htt
 	}
 	if err != nil {
 		s.m.Request(t.route.Name, metrics.DecisionCommitLost)
-		// The backend already did the work; the response goes out and the
-		// loss is surfaced. The reservation stays held until it expires.
-		s.log.Error("commit failed; served request will not be settled", "route", t.route.Name, "payer", t.payment.Payer.Hex(), "err", err)
+		// Not committed means not settled: the response is withheld (its
+		// body has not left yet). Otherwise an authorization that expires
+		// while a slow backend works, or a Redis outage, would serve for
+		// free. The reservation stays held until it expires.
+		s.log.Error("commit failed; response withheld", "route", t.route.Name, "payer", t.payment.Payer.Hex(), "err", err)
 		t.finished = true
-		return continueResponse(nil)
+		if errors.Is(err, payerstate.ErrExpired) {
+			return immediate(typev3.StatusCode_PaymentRequired, nil, []byte(`{"error":"payment_expired","message":"the payment authorization expired before the response was ready; nothing was charged"}`), "x402_commit_expired")
+		}
+		return immediate(typev3.StatusCode_ServiceUnavailable, nil, []byte(`{"error":"payment_unavailable","message":"the payment could not be recorded; nothing was charged"}`), "x402_commit_failed")
 	}
 	t.finished = true
 	s.m.Request(t.route.Name, metrics.DecisionServed)
@@ -513,6 +564,73 @@ func appendHeader(k, v string) *corev3.HeaderValueOption {
 		Header:       &corev3.HeaderValue{Key: k, RawValue: []byte(v)},
 		AppendAction: corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD,
 	}
+}
+
+// routeMatches matches an Envoy route name against a pattern of
+// "/"-separated path.Match globs; the name may have more segments.
+func routeMatches(pattern, name string) bool {
+	ps, ns := strings.Split(pattern, "/"), strings.Split(name, "/")
+	if name == "" || len(ns) < len(ps) {
+		return false
+	}
+	for i, p := range ps {
+		if ok, err := path.Match(p, ns[i]); err != nil || !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// preflight answers a CORS preflight for a priced route: any origin may
+// send the method and headers it asked for, and read the x402 headers.
+// Whether a browser may read the paid response itself is still the
+// backend's to say (its own Access-Control-Allow-Origin).
+func preflight(hdr map[string]string) *extprocv3.ProcessingResponse {
+	set := []*corev3.HeaderValueOption{
+		setHeader("access-control-allow-origin", "*"),
+		setHeader("access-control-allow-methods", sanitizeToken(hdr["access-control-request-method"])),
+		setHeader("access-control-expose-headers", x402.HeaderPaymentRequired+", "+x402.HeaderPaymentResponse),
+		setHeader("access-control-max-age", "600"),
+		setHeader("vary", "origin, access-control-request-method, access-control-request-headers"),
+	}
+	if h := sanitizeList(hdr["access-control-request-headers"]); h != "" {
+		set = append(set, setHeader("access-control-allow-headers", h))
+	}
+	return immediate(typev3.StatusCode_NoContent, set, nil, "x402_preflight")
+}
+
+// sanitizeToken keeps an HTTP token (a method name); sanitizeList a
+// comma-separated list of header names. Anything else is dropped, so a
+// client's bytes never reach a response header unchecked.
+func sanitizeToken(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" || len(v) > 32 {
+		return "GET"
+	}
+	for _, r := range v {
+		if !(r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+			return "GET"
+		}
+	}
+	return v
+}
+
+func sanitizeList(v string) string {
+	var out []string
+	for _, h := range strings.Split(v, ",") {
+		h = strings.TrimSpace(h)
+		ok := h != "" && len(h) <= 64
+		for _, r := range h {
+			if !(r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_') {
+				ok = false
+				break
+			}
+		}
+		if ok && len(out) < 20 {
+			out = append(out, h)
+		}
+	}
+	return strings.Join(out, ", ")
 }
 
 func continueRequest(set []*corev3.HeaderValueOption, remove []string) *extprocv3.ProcessingResponse {

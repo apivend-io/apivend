@@ -53,7 +53,7 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "x402.labels" . | nindent 8 }}
+        {{- include "x402.podLabels" . | nindent 8 }}
         app.kubernetes.io/component: demo
     spec:
       {{- if .Values.demo.priceTable }}

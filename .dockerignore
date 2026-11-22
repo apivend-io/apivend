@@ -2,3 +2,12 @@ bin/
 .git/
 *.md
 docs/
+# Never in a build context (the build stage copies the whole tree): local
+# secrets, private business documents, keys and encrypted backups.
+.env
+.env.*
+private/
+.claude/
+**/*.pem
+**/*.key
+**/*.age

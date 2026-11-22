@@ -91,7 +91,8 @@ func (f *facilitator) serve(w http.ResponseWriter, r *http.Request) {
 	transfer := func() (string, error) {
 		f.txSeq++
 		tx := fmt.Sprintf("0x%064x", f.txSeq)
-		return tx, f.chain.Transfer(from, nonce, amount, tx)
+		to, _ := evm.ParseAddress(ex.Authorization.To)
+		return tx, f.chain.TransferTo(from, to, nonce, amount, tx)
 	}
 
 	switch f.mode {
@@ -594,4 +595,103 @@ func TestNoBackendForTheNetworkWaitsInsteadOfFailing(t *testing.T) {
 	}
 	// It stays queued (retried every 15 s, in real time) until the
 	// configuration gains a backend for the network or it expires.
+}
+
+// A payer who cancels the authorization after presenting it (USDC's
+// cancelAuthorization) leaves the nonce "used" on chain too. That is not a
+// payment: unpaid, and the payer is blocked.
+func TestCancelledAuthorizationIsUnpaidNotSettled(t *testing.T) {
+	e := newEnv(t)
+	fac := newFakeFacilitator(t, e.chain)
+	fac.set("refuse")
+	e.use(fac)
+	id := e.serve(10_000)
+	e.chain.Cancel(e.wallet.Addr, [32]byte{e.nonce})
+	e.drain(8)
+
+	rc := e.final(id)
+	if rc.Status != receipts.StatusUnpaid || rc.Reason != "authorization_canceled" {
+		t.Fatalf("receipt = %+v", rc)
+	}
+	_, err := e.state.Reserve(context.Background(), payerstate.Request{Chain: network, Asset: usdc,
+		Payer: e.wallet.Addr.Hex(), Nonce: "0xff", Amount: big.NewInt(1), Expiry: time.Now().Add(time.Minute)})
+	var denied *payerstate.DeniedError
+	if !errors.As(err, &denied) || denied.Reason != payerstate.ReasonPayerBlocked {
+		t.Fatalf("payer not blocked: %v", err)
+	}
+}
+
+// A refusal is final for that attempt: the next backend is not asked to
+// overrule it (a facilitator may refuse a payer it screens out).
+func TestRefusalDoesNotFailOver(t *testing.T) {
+	e := newEnv(t)
+	primary, secondary := newFakeFacilitator(t, e.chain), newFakeFacilitator(t, e.chain)
+	primary.set("refuse")
+	e.use(primary, secondary)
+	e.settler.MaxAttempts = 1
+	id := e.serve(10_000)
+	e.drain(4)
+	if rc := e.final(id); rc.Status == receipts.StatusSettled {
+		t.Fatalf("settled by the second backend after a refusal: %+v", rc)
+	}
+	if secondary.count() != 0 {
+		t.Fatalf("secondary asked %d times after a refusal", secondary.count())
+	}
+}
+
+// Grokky's H1 (2026-11-22): the payer signs a second authorization with the
+// same nonce, for 1 unit to an address they control, and settles it
+// elsewhere before the gateway does. The nonce is "used" and its
+// AuthorizationUsed log exists, but the transfer is not this payment:
+// unpaid, and the payer is blocked. Also when the amount is short.
+func TestPreemptedNonceIsUnpaidAndBlocks(t *testing.T) {
+	attacker, _ := evm.ParseAddress("0x00000000000000000000000000000000000000ee")
+	us, _ := evm.ParseAddress(payTo)
+	for name, preempt := range map[string]func(e *env) error{
+		"other recipient": func(e *env) error {
+			return e.chain.TransferTo(e.wallet.Addr, attacker, [32]byte{e.nonce}, big.NewInt(1), "0xpre1")
+		},
+		"short amount to us": func(e *env) error {
+			return e.chain.TransferTo(e.wallet.Addr, us, [32]byte{e.nonce}, big.NewInt(1), "0xpre2")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			fac := newFakeFacilitator(t, e.chain)
+			e.use(fac) // a normal facilitator: its settle fails, the nonce is used
+			id := e.serve(10_000)
+			if err := preempt(e); err != nil {
+				t.Fatal(err)
+			}
+			e.drain(8)
+			rc := e.final(id)
+			if rc.Status != receipts.StatusUnpaid || rc.Reason != "authorization_preempted" {
+				t.Fatalf("receipt = %+v", rc)
+			}
+			_, err := e.state.Reserve(context.Background(), payerstate.Request{Chain: network, Asset: usdc,
+				Payer: e.wallet.Addr.Hex(), Nonce: "0xff", Amount: big.NewInt(1), Expiry: time.Now().Add(time.Minute)})
+			var denied *payerstate.DeniedError
+			if !errors.As(err, &denied) || denied.Reason != payerstate.ReasonPayerBlocked {
+				t.Fatalf("payer not blocked: %v", err)
+			}
+		})
+	}
+}
+
+// Our own transfer, found on chain after a lost answer, still counts as
+// paid: the AuthorizationUsed log and the Transfer to us of the amount.
+func TestOwnTransferFoundOnChainIsSettled(t *testing.T) {
+	e := newEnv(t)
+	fac := newFakeFacilitator(t, e.chain)
+	fac.set("refuse")
+	e.use(fac)
+	id := e.serve(10_000)
+	us, _ := evm.ParseAddress(payTo)
+	if err := e.chain.TransferTo(e.wallet.Addr, us, [32]byte{e.nonce}, big.NewInt(10_000), "0xours"); err != nil {
+		t.Fatal(err)
+	}
+	e.drain(8)
+	if rc := e.final(id); rc.Status != receipts.StatusSettled {
+		t.Fatalf("receipt = %+v", rc)
+	}
 }

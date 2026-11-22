@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"slices"
 	"sort"
 	"strings"
@@ -78,6 +79,9 @@ type Reconciler struct {
 	// Batch holds the batch-settlement channel terms (our receiver
 	// authorizer). Nil: policies offering batch-settlement are rejected.
 	Batch *pricing.BatchConfig
+	// DefaultMaxUnsettledPerRoute applies to policies that set no
+	// settlement.maxUnsettledPerRoute ("" : no cap).
+	DefaultMaxUnsettledPerRoute string
 }
 
 // DefaultMessageTimeout is Reconciler.MessageTimeout when unset.
@@ -211,7 +215,8 @@ func (r *Reconciler) syncPolicies(ctx context.Context, providers map[string]bool
 	})
 
 	var accepted []renderedPolicy
-	claimed := map[string]string{} // target route -> policy that owns it
+	var refused []*x402v1.PaymentPolicy // rejected: their routes answer 503
+	claimed := map[string]string{}      // target route -> policy that owns it
 	for i := range list.Items {
 		p := &list.Items[i]
 		rc, reason, err := r.acceptPolicy(ctx, p, providers, claimed)
@@ -220,9 +225,15 @@ func (r *Reconciler) syncPolicies(ctx context.Context, providers map[string]bool
 		}
 		if reason != nil {
 			if err := r.setPolicyConditions(ctx, p, *reason, metav1.Condition{
-				Type: x402v1.ConditionProgrammed, Status: metav1.ConditionFalse, Reason: "NotAccepted", Message: "policy is not accepted",
+				Type: x402v1.ConditionProgrammed, Status: metav1.ConditionFalse, Reason: "NotAccepted",
+				Message: "policy is not accepted: its HTTPRoute answers 503 until it is fixed or deleted",
 			}); err != nil {
 				return err
+			}
+			// A route its owner meant to price is refused, never served
+			// free, unless another policy prices it.
+			if ref := p.Spec.TargetRef; reason.Reason != "Conflicted" && ref.Group == httpRouteGVK.Group && ref.Kind == httpRouteGVK.Kind {
+				refused = append(refused, p)
 			}
 			continue
 		}
@@ -233,6 +244,11 @@ func (r *Reconciler) syncPolicies(ctx context.Context, providers map[string]bool
 	cfg := pricing.Config{Batch: r.Batch}
 	for _, a := range accepted {
 		cfg.Routes = append(cfg.Routes, a.route)
+	}
+	for _, p := range refused {
+		if _, priced := claimed[p.Namespace+"/"+p.Spec.TargetRef.Name]; !priced && validTargetName(p.Spec.TargetRef.Name) {
+			cfg.Refuse = append(cfg.Refuse, refusePrefix(p))
+		}
 	}
 	raw, err := yaml.Marshal(cfg)
 	if err != nil {
@@ -252,6 +268,9 @@ func (r *Reconciler) syncPolicies(ctx context.Context, providers map[string]bool
 	for _, a := range accepted {
 		namespaces[a.policy.Namespace] = true
 	}
+	for _, p := range refused {
+		namespaces[p.Namespace] = true
+	}
 	if err := r.syncReferenceGrants(ctx, namespaces); err != nil {
 		return err
 	}
@@ -270,7 +289,23 @@ func (r *Reconciler) syncPolicies(ctx context.Context, providers map[string]bool
 			return err
 		}
 	}
-	return r.pruneExtensionPolicies(ctx, accepted)
+	// A refused route keeps the filter attached, so the refusal is applied.
+	for _, p := range refused {
+		if err := r.applyExtensionPolicy(ctx, p); err != nil && !isGatewayMissing(err) {
+			return err
+		}
+	}
+	return r.pruneExtensionPolicies(ctx, accepted, refused)
+}
+
+func refusePrefix(p *x402v1.PaymentPolicy) string {
+	return fmt.Sprintf("httproute/%s/%s/", p.Namespace, p.Spec.TargetRef.Name)
+}
+
+// validTargetName: a DNS label (Kubernetes object name), so the prefix
+// cannot reach another route's name.
+func validTargetName(n string) bool {
+	return n != "" && len(n) <= 253 && !strings.ContainsAny(n, "/ ")
 }
 
 // acceptPolicy validates one policy. It returns either the route to render or
@@ -285,6 +320,18 @@ func (r *Reconciler) acceptPolicy(ctx context.Context, p *x402v1.PaymentPolicy, 
 		}
 	}
 	rc := RouteConfigFor(p)
+	// The gateway's default per-route cap, for async routes: a sync route
+	// settles before it serves, so its unsettled amount is only what is
+	// settling at that moment.
+	// A route priced above the default gets its own price as the cap.
+	if d := r.DefaultMaxUnsettledPerRoute; d != "" && rc.Settlement.MaxUnsettledPerRoute == "" && rc.Settlement.Mode != "sync" {
+		rc.Settlement.MaxUnsettledPerRoute = d
+		if price, ok := new(big.Rat).SetString(rc.Price.Amount); ok {
+			if cap, ok := new(big.Rat).SetString(d); ok && price.Cmp(cap) > 0 {
+				rc.Settlement.MaxUnsettledPerRoute = rc.Price.Amount
+			}
+		}
+	}
 
 	// One parser: exactly the validation the filter will apply.
 	if _, err := pricing.Build(pricing.Config{Routes: []pricing.RouteConfig{rc}, Batch: r.Batch}); err != nil {
@@ -337,6 +384,7 @@ func RouteConfigFor(p *x402v1.PaymentPolicy) pricing.RouteConfig {
 	if s := p.Spec.Settlement; s != nil {
 		rc.Settlement.Mode = s.Mode
 		rc.Settlement.MaxUnsettledPerPayer = s.MaxUnsettledPerPayer
+		rc.Settlement.MaxUnsettledPerRoute = s.MaxUnsettledPerRoute
 		if s.ProviderRef != nil {
 			rc.Settlement.ProviderRef = &pricing.ProviderRef{Name: s.ProviderRef.Name}
 		}
@@ -504,10 +552,13 @@ func (r *Reconciler) applyExtensionPolicy(ctx context.Context, p *x402v1.Payment
 	return err
 }
 
-func (r *Reconciler) pruneExtensionPolicies(ctx context.Context, accepted []renderedPolicy) error {
+func (r *Reconciler) pruneExtensionPolicies(ctx context.Context, accepted []renderedPolicy, refused []*x402v1.PaymentPolicy) error {
 	keep := map[string]bool{}
 	for _, a := range accepted {
 		keep[a.policy.Namespace+"/"+extensionPolicyName(a.policy)] = true
+	}
+	for _, p := range refused {
+		keep[p.Namespace+"/"+extensionPolicyName(p)] = true
 	}
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(extensionGVK)

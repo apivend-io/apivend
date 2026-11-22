@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>apivend demo</title>
 <meta name="description" content="Pay-per-request APIs over x402: live prices and real settled payments in USDC on Base.">
+<link rel="alternate" type="text/plain" href="/llms.txt" title="For agents: the APIs here and how to pay">
 <link rel="icon" href="/favicon.ico" sizes="48x48">
 <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
@@ -137,8 +138,19 @@
   /* The commands wrap instead of scrolling sideways. */
   .steps pre { white-space: pre-wrap; overflow-wrap: anywhere; }
   pre code { font: inherit; }
+  /* Client snippets keep their indentation and scroll inside the block. */
+  .clients { margin: 0 0 10px; min-width: 0; }
+  .clients pre { white-space: pre; overflow-wrap: normal; border-radius: 0 0 4px 4px; }
+  .tabbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--rule); }
+  .tabbar [role=tablist] { display: flex; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  .tabbar button { font: 500 14px var(--sans); color: var(--muted); background: none; border: 0; padding: 8px 12px; min-height: 44px; cursor: pointer; white-space: nowrap; flex: none; }
+  .tabbar [role=tab][aria-selected=true] { color: var(--text); box-shadow: inset 0 -2px 0 var(--coin); }
+  .tabbar [role=tab]:hover, .tabbar .copy:hover { color: var(--text); }
+  .steps p.agents { margin-top: 10px; }
+  @media (max-width: 480px) { .tabbar button { padding: 8px 6px; font-size: 13px; } .tabbar { gap: 4px; } }
   footer { border-top: 1px solid var(--rule); color: var(--muted); font-size: 14px; padding: 20px 0 32px; }
   footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  footer .links { display: flex; gap: 20px; }
 
   @media (max-width: 560px) { .menu { grid-template-columns: minmax(0, 1fr); } }
   @media (max-width: 860px) {
@@ -174,7 +186,7 @@
         <div class="stage" id="stage" aria-hidden="true"></div>
         <div class="under">
           <p class="flat-note">A coin drops here each time a payment settles on chain.</p>
-          <p class="head" id="head" hidden><span id="headNet">Base</span> block <span class="mono" id="headBlock"></span></p>
+          <p class="head" id="head" hidden></p>
         </div>
         <div class="slot" aria-hidden="true"></div>
       </div>
@@ -192,13 +204,65 @@
         <pre><code id="cmdAsk">curl -i …</code></pre></li>
       <li><h3>Pay and ask again</h3>
         <p>An x402 client signs a USDC authorization for exactly that price and repeats the request with it. Nothing moves until the API has answered.</p>
-        <pre><code id="cmdPay">X402_PRIVATE_KEY=0x… x402-pay …</code></pre></li>
+        <div class="clients" id="clients">
+          <div class="tabbar">
+            <div role="tablist" aria-label="x402 client">
+              <button type="button" role="tab" id="tab-js" aria-controls="pane-js" aria-selected="true">JavaScript</button>
+              <button type="button" role="tab" id="tab-py" aria-controls="pane-py" aria-selected="false" tabindex="-1">Python</button>
+              <button type="button" role="tab" id="tab-go" aria-controls="pane-go" aria-selected="false" tabindex="-1">Go</button>
+              <button type="button" role="tab" id="tab-cli" aria-controls="pane-cli" aria-selected="false" tabindex="-1">x402-pay</button>
+            </div>
+            <button type="button" class="copy" id="copyClient">Copy</button>
+          </div>
+<div role="tabpanel" id="pane-js" aria-labelledby="tab-js" tabindex="0"><pre><code data-client>npm install @x402/fetch @x402/evm viem
+
+import { wrapFetchWithPaymentFromConfig } from "@x402/fetch";
+import { ExactEvmScheme } from "@x402/evm";
+import { privateKeyToAccount } from "viem/accounts";
+
+const account = privateKeyToAccount(process.env.X402_PRIVATE_KEY);
+const pay = wrapFetchWithPaymentFromConfig(fetch, {
+  schemes: [{ network: "eip155:84532", client: new ExactEvmScheme(account) }], // Base Sepolia only
+});
+const res = await pay("{URL}");
+console.log(await res.text());</code></pre></div>
+<div role="tabpanel" id="pane-py" aria-labelledby="tab-py" tabindex="0" hidden><pre><code data-client>pip install "x402[requests,evm]" httpx  # x402 needs httpx but does not install it
+
+import os
+from eth_account import Account
+from x402 import x402ClientSync
+from x402.http.clients import x402_requests
+from x402.mechanisms.evm.exact import ExactEvmScheme
+from x402.mechanisms.evm.signers import EthAccountSigner
+
+account = Account.from_key(os.environ["X402_PRIVATE_KEY"])
+client = x402ClientSync()
+client.register("eip155:84532", ExactEvmScheme(signer=EthAccountSigner(account)))  # Base Sepolia only
+print(x402_requests(client).get("{URL}").text)</code></pre></div>
+<div role="tabpanel" id="pane-go" aria-labelledby="tab-go" tabindex="0" hidden><pre><code data-client>go get github.com/x402-foundation/x402/go/v2
+
+import (
+	x402 "github.com/x402-foundation/x402/go/v2"
+	x402http "github.com/x402-foundation/x402/go/v2/http"
+	evm "github.com/x402-foundation/x402/go/v2/mechanisms/evm/exact/client"
+	evmsigners "github.com/x402-foundation/x402/go/v2/signers/evm"
+)
+
+signer, err := evmsigners.NewClientSignerFromPrivateKey(os.Getenv("X402_PRIVATE_KEY"))
+client := x402.Newx402Client()
+client.Register("eip155:84532", evm.NewExactEvmScheme(signer, nil)) // Base Sepolia only
+pay := x402http.WrapHTTPClientWithPayment(http.DefaultClient, x402http.Newx402HTTPClient(client))
+resp, err := pay.Get("{URL}")</code></pre></div>
+<div role="tabpanel" id="pane-cli" aria-labelledby="tab-cli" tabindex="0" hidden><pre><code data-client>go install apivend.io/apivend/cmd/x402-pay@latest
+X402_PRIVATE_KEY=0x… x402-pay "{URL}"</code></pre></div>
+        </div>
+        <p class="agents">The snippets pay on Base Sepolia only (<span class="mono">eip155:84532</span>), so the key next to them cannot pay real USDC by mistake. Agents with a wallet pay the same way, for example through <a href="https://www.coinbase.com/developer-platform/discover/launches/payments-mcp" rel="noopener">Coinbase's Payments MCP</a> or <a href="https://developers.cloudflare.com/agents/tools/payments/x402/" rel="noopener">Cloudflare's Agents SDK</a>.</p></li>
       <li><h3>Find your receipt</h3>
-        <p>Once the payment settles on chain, usually within seconds, it prints on the tape with a link to the transaction.</p></li>
+        <p>The answer comes first and the payment settles about a second later, so <span class="mono">PAYMENT-RESPONSE</span> has no transaction yet. Once it settles it prints on the tape with a link to the transaction, and <span class="mono">/api/feed?payer=</span> with your address lists your own payments.</p></li>
     </ol>
 
     <h2 class="runs">What runs this page</h2>
-    <p>This page is a reference deployment of apivend, the payment gateway these APIs sit behind. The APIs themselves are ordinary HTTP services with no payment code.</p>
+    <p>This page is a reference deployment of <a href="https://github.com/apivend-io/apivend" rel="noopener">apivend</a>, the open-source payment gateway these APIs sit behind. The APIs themselves are ordinary HTTP services with no payment code.</p>
     <dl class="stack">
       <dt>Gateway</dt><dd>Envoy Gateway with apivend's x402 filter. It prices each route and checks every payment before the request reaches the API.</dd>
       <dt>Prices</dt><dd>A <span class="mono">PaymentPolicy</span> per route, kept in Kubernetes. Changing a price takes effect in under a second.</dd>
@@ -223,7 +287,7 @@
 <footer>
   <div class="wrap">
     <span>Payments use the x402 protocol: HTTP 402 and USDC authorizations (EIP-3009).</span>
-    <a href="https://apivend.io">apivend.io</a>
+    <span class="links"><a href="/llms.txt">For agents: llms.txt</a> <a href="https://github.com/apivend-io/apivend" rel="noopener">GitHub</a> <a href="https://apivend.io">apivend.io</a></span>
   </div>
 </footer>
 
@@ -279,7 +343,10 @@ async function menu() {
   }));
   const first = (rs.find(isTest) || rs.find(r => r.priced) || rs[0]).url;
   $('cmdAsk').textContent = 'curl -i "' + first + '"';
-  $('cmdPay').textContent = 'X402_PRIVATE_KEY=0x… x402-pay "' + first + '"\n\n# or any x402 client, e.g. @x402/fetch in JavaScript';
+  document.querySelectorAll('[data-client]').forEach(c => {
+    c.dataset.tpl = c.dataset.tpl || c.textContent;
+    c.textContent = c.dataset.tpl.replace('{' + 'URL}', first); // split, so the server's fill-in of the snippets leaves this alone
+  });
 }
 
 // The tape keeps a fixed length: the newest TAPE receipts. Receipts whose coin
@@ -344,7 +411,7 @@ function draw() {
     li.append(el('span', { className: 'meta' },
       el('span', { textContent: day(p.at) + ' ' + clock(p.at), title: new Date(p.at).toISOString() }),
       el('span', { textContent: nets[p.network] || p.network }),
-      el('span', { textContent: p.own ? 'our test wallet' : 'from ' + short(p.payer), title: p.payer }), tx));
+      el('span', { textContent: 'from ' + short(p.payer), title: p.payer }), tx));
     return li;
   }));
   printing.clear();
@@ -355,8 +422,10 @@ async function chain() {
   const hs = await (await fetch('/api/chain')).json();
   const h = hs.find(x => !testnets.has(x.network)) || hs[0];
   if (!h) { $('head').hidden = true; return; }
-  $('headNet').textContent = nets[h.network] || h.network;
-  $('headBlock').textContent = fmtBlock(h.block);
+  // Written whole by the script: without it there is no block number, so
+  // no "block" label either.
+  $('head').replaceChildren(document.createTextNode((nets[h.network] || h.network) + ' block '),
+    el('span', { className: 'mono', textContent: fmtBlock(h.block) }));
   $('head').hidden = false;
 }
 
@@ -377,11 +446,39 @@ async function flow() {
   const note = $('ownNote');
   if (st.ownPayers > 0) {
     note.replaceChildren(st.otherPayers === 0
-      ? 'So far every payment is from our own test wallet, marked on the receipts. Yours would be the first.'
-      : 'Not counted above: our own test wallet, marked on the receipts.');
+      ? 'So far every payment is from our own test wallet. Yours would be the first.'
+      : 'Not counted above: our own test wallet.');
     note.hidden = false;
   } else note.hidden = true;
 }
+
+// Step 2: one client at a time, chosen with tabs (arrow keys move between them).
+(function clients() {
+  const tabs = [...document.querySelectorAll('#clients [role=tab]')];
+  const pick = (t, focus) => {
+    for (const x of tabs) {
+      const on = x === t;
+      x.setAttribute('aria-selected', on); x.tabIndex = on ? 0 : -1;
+      $(x.getAttribute('aria-controls')).hidden = !on;
+    }
+    if (focus) t.focus();
+  };
+  tabs.forEach((t, i) => {
+    t.addEventListener('click', () => pick(t));
+    t.addEventListener('keydown', e => {
+      const j = e.key === 'ArrowRight' ? i + 1 : e.key === 'ArrowLeft' ? i - 1 : e.key === 'Home' ? 0 : e.key === 'End' ? tabs.length - 1 : null;
+      if (j === null) return;
+      e.preventDefault(); pick(tabs[(j + tabs.length) % tabs.length], true);
+    });
+  });
+  const copy = $('copyClient');
+  copy.addEventListener('click', async () => {
+    const pane = document.querySelector('#clients [role=tabpanel]:not([hidden]) code');
+    try { await navigator.clipboard.writeText(pane.textContent); copy.textContent = 'Copied'; }
+    catch { getSelection().selectAllChildren(pane); copy.textContent = 'Selected'; }
+    setTimeout(() => { copy.textContent = 'Copy'; }, 1600);
+  });
+})();
 
 const safely = f => f().catch(() => {});
 safely(menu).then(() => safely(receipts));

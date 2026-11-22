@@ -232,6 +232,16 @@ spec:
                       per payer in async mode. Default "1.00".
                     pattern: ^[0-9]*\.?[0-9]+$
                     type: string
+                  maxUnsettledPerRoute:
+                    description: |-
+                      MaxUnsettledPerRoute caps, in the price currency, what this route may
+                      have served-but-unsettled across all payers. Payer addresses are free,
+                      so the per-payer cap alone does not bound the seller's loss in async
+                      mode. A payment past it is refused (503, Retry-After) until
+                      settlements catch up. Default: the controller's
+                      -default-max-unsettled-per-route, or no cap.
+                    pattern: ^[0-9]*\.?[0-9]+$
+                    type: string
                   mode:
                     description: |-
                       Mode is async (respond, then settle; the default) or sync (hold the

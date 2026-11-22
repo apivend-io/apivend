@@ -18,9 +18,12 @@ type Fake struct {
 	used    map[[32]byte]bool
 	events  []AuthEvent
 	txs     map[string]uint64
-	Block   uint64
-	Err     error // returned by every call when set
-	Reads   int   // number of balance read calls served
+	// transfers: each transaction's Transfer logs, by log index.
+	transfers map[string]map[uint64]TransferLog
+	logIndex  uint64
+	Block     uint64
+	Err       error // returned by every call when set
+	Reads     int   // number of balance read calls served
 	// MaxLogRange, when set, makes AuthEvents refuse wider block ranges, as
 	// RPC providers do (the public Base endpoints allow 200).
 	MaxLogRange uint64
@@ -70,9 +73,16 @@ func (f *Fake) SetErr(err error) {
 	f.Err = err
 }
 
-// Transfer applies an EIP-3009 transfer: marks the nonce used, debits the
-// payer and records the transaction. It fails as the token contract would.
+// Transfer applies an EIP-3009 transfer to no one in particular (the zero
+// address); TransferTo names the recipient.
 func (f *Fake) Transfer(from evm.Address, nonce [32]byte, amount *big.Int, txHash string) error {
+	return f.TransferTo(from, evm.Address{}, nonce, amount, txHash)
+}
+
+// TransferTo applies an EIP-3009 transfer: marks the nonce used, debits
+// the payer, and records the transaction with its AuthorizationUsed and
+// Transfer logs. It fails as the token contract would.
+func (f *Fake) TransferTo(from, to evm.Address, nonce [32]byte, amount *big.Int, txHash string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.used[nonce] {
@@ -84,9 +94,30 @@ func (f *Fake) Transfer(from evm.Address, nonce [32]byte, amount *big.Int, txHas
 	}
 	f.setLocked(from, new(big.Int).Sub(bal, amount))
 	f.used[nonce] = true
-	f.events = append(f.events, AuthEvent{Authorizer: from, Nonce: nonce, Block: f.Block, BlockHash: fakeHash(f.Block)})
+	f.logIndex++
+	f.events = append(f.events, AuthEvent{Authorizer: from, Nonce: nonce, Block: f.Block, BlockHash: fakeHash(f.Block), TxHash: txHash, LogIndex: f.logIndex})
+	if f.transfers == nil {
+		f.transfers = map[string]map[uint64]TransferLog{}
+	}
+	if f.transfers[txHash] == nil {
+		f.transfers[txHash] = map[uint64]TransferLog{}
+	}
+	f.logIndex++
+	f.transfers[txHash][f.logIndex] = TransferLog{From: from, To: to, Value: new(big.Int).Set(amount)}
 	f.txs[txHash] = f.Block
 	return nil
+}
+
+// TransferAfter implements the RPC method of the same name.
+func (f *Fake) TransferAfter(_ context.Context, txHash string, token evm.Address, logIndex uint64) (TransferLog, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Err != nil {
+		return TransferLog{}, false, f.Err
+	}
+	t, ok := f.transfers[txHash][logIndex+1]
+	t.Token = token
+	return t, ok, nil
 }
 
 // Cancel marks an authorization cancelled by its signer, in a new block.
@@ -164,6 +195,18 @@ func (f *Fake) AuthEvents(_ context.Context, _ evm.Address, authorizers []evm.Ad
 		}
 	}
 	return out, nil
+}
+
+// NonceEvents is AuthEvents for one authorizer's nonce.
+func (f *Fake) NonceEvents(ctx context.Context, token, authorizer evm.Address, nonce [32]byte, from, to uint64) ([]AuthEvent, error) {
+	evs, err := f.AuthEvents(ctx, token, []evm.Address{authorizer}, from, to)
+	var out []AuthEvent
+	for _, e := range evs {
+		if e.Nonce == nonce {
+			out = append(out, e)
+		}
+	}
+	return out, err
 }
 
 func (f *Fake) AuthorizationState(_ context.Context, _, _ evm.Address, nonce [32]byte) (bool, error) {

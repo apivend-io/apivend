@@ -309,3 +309,34 @@ func TestChainCheckerCounterfactual(t *testing.T) {
 }
 
 func big1() *big.Int { return big.NewInt(1) }
+
+// Checks spend from one budget of RPC calls: fresh addresses (which the
+// no-code memory cannot help with) get ErrBusy once it is spent, and the
+// budget refills with time.
+func TestChainCheckerBudget(t *testing.T) {
+	ctx := context.Background()
+	n := &node{reply: func(to, data string) (any, map[string]any) { return "0x", nil }}
+	clock := time.Unix(1_800_000_000, 0)
+	cc := &verify.ChainChecker{Chains: map[string]verify.Caller{"eip155:84532": n.start(t)}, Now: func() time.Time { return clock },
+		PerSecond: 2, Burst: 3}
+	fresh := func(i int) evm.Address { var a evm.Address; a[19] = byte(i); a[0] = 0xfe; return a }
+	busy := 0
+	for i := 0; i < 5; i++ {
+		_, err := cc.IsValidSignature(ctx, "eip155:84532", fresh(i), [32]byte{1}, make([]byte, 65))
+		if errors.Is(err, verify.ErrBusy) {
+			busy++
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if busy != 2 || n.calls != 3 {
+		t.Fatalf("burst of 3: %d busy, %d calls", busy, n.calls)
+	}
+	clock = clock.Add(time.Second) // two more
+	for i := 10; i < 13; i++ {
+		cc.IsValidSignature(ctx, "eip155:84532", fresh(i), [32]byte{1}, make([]byte, 65))
+	}
+	if n.calls != 5 {
+		t.Fatalf("after a second at 2/s: %d calls, want 5", n.calls)
+	}
+}

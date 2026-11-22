@@ -5,6 +5,7 @@ package main
 import (
 	"flag"
 	"os"
+	"regexp"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -33,6 +34,7 @@ func main() {
 		probeAddr     = flag.String("health", ":9105", "listen address for health probes")
 		leaderElect   = flag.Bool("leader-elect", true, "run only one active controller")
 		batchAuth     = flag.String("batch-receiver-authorizer", "", "address of our batch-settlement claim key (the settler holds the key); empty: no route may offer batch-settlement")
+		routeCap      = flag.String("default-max-unsettled-per-route", "", "served-but-unsettled cap per async route across payers, in USD, for policies that set none (empty: no cap)")
 		batchDelay    = flag.Uint64("batch-withdraw-delay", 86400, "batch-settlement withdrawal delay in seconds (900 to 2592000): how long a payer waits to withdraw, and our window to claim")
 	)
 	flag.Parse()
@@ -40,6 +42,10 @@ func main() {
 	log := ctrl.Log.WithName("setup")
 	if *namespace == "" {
 		log.Info("-namespace (or POD_NAMESPACE) is required")
+		os.Exit(1)
+	}
+	if *routeCap != "" && !amountRE.MatchString(*routeCap) {
+		log.Info("-default-max-unsettled-per-route: an amount such as 5.00", "value", *routeCap)
 		os.Exit(1)
 	}
 
@@ -73,6 +79,8 @@ func main() {
 		FilterService:   *filterService,
 		FilterPort:      *filterPort,
 		MessageTimeout:  *msgTimeout,
+
+		DefaultMaxUnsettledPerRoute: *routeCap,
 	}
 	if *batchAuth != "" {
 		r.Batch = &pricing.BatchConfig{ReceiverAuthorizer: *batchAuth, WithdrawDelay: *batchDelay}
@@ -88,3 +96,6 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// amountRE is the CRD's pattern for USD amounts.
+var amountRE = regexp.MustCompile(`^[0-9]*\.?[0-9]+$`)

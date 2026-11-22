@@ -87,7 +87,9 @@ func main() {
 	if *postgresDSN == "" {
 		log.Warn("no -postgres: receipts are written to the log only")
 	} else {
-		pg, err := receipts.OpenPostgres(context.Background(), *postgresDSN)
+		pg, err := cliutil.OpenWithRetry(log, "postgres", 30*time.Second, func(ctx context.Context) (*receipts.Postgres, error) {
+			return receipts.OpenPostgres(ctx, *postgresDSN)
+		})
 		if err != nil {
 			fatal("connect to postgres", err)
 		}

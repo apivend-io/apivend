@@ -93,7 +93,7 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "x402.labels" . | nindent 8 }}
+        {{- include "x402.podLabels" . | nindent 8 }}
         app.kubernetes.io/component: controller
     spec:
       serviceAccountName: x402-controller
@@ -113,6 +113,9 @@ spec:
             - -routes-configmap=x402-routes
             - -providers-secret=x402-providers
             - -message-timeout={{ .Values.controller.messageTimeout }}
+            {{- with .Values.controller.defaultMaxUnsettledPerRoute }}
+            - -default-max-unsettled-per-route={{ . }}
+            {{- end }}
             {{- with .Values.controller.batch.receiverAuthorizer }}
             - -batch-receiver-authorizer={{ . }}
             - -batch-withdraw-delay={{ $.Values.controller.batch.withdrawDelay }}

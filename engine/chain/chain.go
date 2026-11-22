@@ -344,12 +344,69 @@ type AuthEvent struct {
 	Canceled   bool
 	Block      uint64
 	BlockHash  string
+	// TxHash and LogIndex locate the log, so the transfer that used the
+	// authorization (the token's next log) can be read: TransferAfter.
+	TxHash   string
+	LogIndex uint64
 }
+
+// TransferLog is an ERC-20 Transfer event.
+type TransferLog struct {
+	Token    evm.Address
+	From, To evm.Address
+	Value    *big.Int
+}
+
+var topicTransfer = evm.Keccak256([]byte("Transfer(address,address,uint256)"))
 
 var (
 	topicAuthUsed     = evm.Keccak256([]byte("AuthorizationUsed(address,bytes32)"))
 	topicAuthCanceled = evm.Keccak256([]byte("AuthorizationCanceled(address,bytes32)"))
 )
+
+// TransferAfter returns the Transfer event the token logged right after
+// the log at logIndex in txHash: in USDC's transferWithAuthorization, the
+// transfer that used the authorization. found is false when that log is
+// not a Transfer of token.
+func (r *RPC) TransferAfter(ctx context.Context, txHash string, token evm.Address, logIndex uint64) (TransferLog, bool, error) {
+	res, err := r.batch(ctx, rpcRequest{Method: "eth_getTransactionReceipt", Params: []any{txHash}})
+	if err != nil {
+		return TransferLog{}, false, err
+	}
+	var rc struct {
+		Logs []struct {
+			Address  string   `json:"address"`
+			Topics   []string `json:"topics"`
+			Data     string   `json:"data"`
+			LogIndex string   `json:"logIndex"`
+		} `json:"logs"`
+	}
+	if string(res[0]) == "null" || json.Unmarshal(res[0], &rc) != nil {
+		return TransferLog{}, false, errors.New("chain: malformed transaction receipt")
+	}
+	for _, l := range rc.Logs {
+		li, err := strconv.ParseUint(strings.TrimPrefix(l.LogIndex, "0x"), 16, 64)
+		if err != nil || li != logIndex+1 {
+			continue
+		}
+		a, err := evm.ParseAddress(l.Address)
+		if err != nil || a != token || len(l.Topics) != 3 {
+			return TransferLog{}, false, nil
+		}
+		t0, err0 := evm.ParseBytes32(l.Topics[0])
+		from, err1 := evm.ParseBytes32(l.Topics[1])
+		to, err2 := evm.ParseBytes32(l.Topics[2])
+		data, err3 := hex.DecodeString(strings.TrimPrefix(l.Data, "0x"))
+		if err0 != nil || err1 != nil || err2 != nil || err3 != nil || t0 != topicTransfer || len(data) != 32 {
+			return TransferLog{}, false, nil
+		}
+		out := TransferLog{Token: token, Value: new(big.Int).SetBytes(data)}
+		copy(out.From[:], from[12:])
+		copy(out.To[:], to[12:])
+		return out, true, nil
+	}
+	return TransferLog{}, false, nil
+}
 
 // Head returns the latest block's number and hash.
 func (r *RPC) Head(ctx context.Context) (uint64, string, error) {
@@ -402,6 +459,16 @@ func (r *RPC) BalancesAt(ctx context.Context, token evm.Address, owners []evm.Ad
 // AuthEvents returns the authorization events of the given authorizers on
 // token in blocks [from, to].
 func (r *RPC) AuthEvents(ctx context.Context, token evm.Address, authorizers []evm.Address, from, to uint64) ([]AuthEvent, error) {
+	return r.authEvents(ctx, token, authorizers, nil, from, to)
+}
+
+// NonceEvents returns the events of one authorizer's nonce in [from, to]
+// (at most one Used or Canceled exists on chain).
+func (r *RPC) NonceEvents(ctx context.Context, token, authorizer evm.Address, nonce [32]byte, from, to uint64) ([]AuthEvent, error) {
+	return r.authEvents(ctx, token, []evm.Address{authorizer}, &nonce, from, to)
+}
+
+func (r *RPC) authEvents(ctx context.Context, token evm.Address, authorizers []evm.Address, nonce *[32]byte, from, to uint64) ([]AuthEvent, error) {
 	if len(authorizers) == 0 || from > to {
 		return nil, nil
 	}
@@ -418,6 +485,9 @@ func (r *RPC) AuthEvents(ctx context.Context, token evm.Address, authorizers []e
 			who,
 		},
 	}
+	if nonce != nil {
+		filter["topics"] = append(filter["topics"].([]any), "0x"+hex.EncodeToString(nonce[:]))
+	}
 	res, err := r.batch(ctx, rpcRequest{Method: "eth_getLogs", Params: []any{filter}})
 	if err != nil {
 		return nil, err
@@ -426,6 +496,8 @@ func (r *RPC) AuthEvents(ctx context.Context, token evm.Address, authorizers []e
 		Topics      []string `json:"topics"`
 		BlockNumber string   `json:"blockNumber"`
 		BlockHash   string   `json:"blockHash"`
+		TxHash      string   `json:"transactionHash"`
+		LogIndex    string   `json:"logIndex"`
 	}
 	if err := json.Unmarshal(res[0], &logs); err != nil {
 		return nil, errors.New("chain: malformed logs")
@@ -442,7 +514,8 @@ func (r *RPC) AuthEvents(ctx context.Context, token evm.Address, authorizers []e
 		if err0 != nil || err1 != nil || err2 != nil || err3 != nil {
 			return nil, errors.New("chain: malformed log entry")
 		}
-		ev := AuthEvent{Nonce: nonce, Canceled: t0 == topicAuthCanceled, Block: block, BlockHash: l.BlockHash}
+		li, _ := strconv.ParseUint(strings.TrimPrefix(l.LogIndex, "0x"), 16, 64)
+		ev := AuthEvent{Nonce: nonce, Canceled: t0 == topicAuthCanceled, Block: block, BlockHash: l.BlockHash, TxHash: l.TxHash, LogIndex: li}
 		copy(ev.Authorizer[:], who[12:])
 		out = append(out, ev)
 	}

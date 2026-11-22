@@ -21,6 +21,7 @@ const (
 	ReasonNonceUsed           = "payment_already_used"
 	ReasonInsufficientBalance = "insufficient_balance"
 	ReasonExposureLimit       = "exposure_limit"
+	ReasonRouteExposureLimit  = "route_exposure_limit"
 	ReasonPayerBlocked        = "payer_blocked"
 )
 
@@ -59,6 +60,11 @@ type Policy struct {
 	// MaxUnsettled caps the payer's in-flight plus not-yet-settled amount on
 	// this asset, in atomic units. Nil means no cap.
 	MaxUnsettled *big.Int
+	// MaxUnsettledPerRoute caps the route's served-but-not-yet-settled
+	// amount across all payers (Request.Route), in atomic units. Nil means
+	// no cap. Payments in flight on the route are not counted: the cap can
+	// be passed by what is being served at that moment.
+	MaxUnsettledPerRoute *big.Int
 	// Freshness is how old a cached balance may be before it is re-read.
 	Freshness time.Duration
 	// AllowOnUnavailable serves the request without a balance check when the
@@ -77,6 +83,9 @@ type Request struct {
 	// remembered until then; afterwards the chain rejects the payment anyway.
 	Expiry time.Time
 	Policy Policy
+	// Route names the priced route, for Policy.MaxUnsettledPerRoute; it is
+	// the same name Job.Route carries at commit.
+	Route string
 	// QueueOnly: work that moves none of the payer's wallet funds (a batch
 	// refund out of escrow). Amount may be zero and the balance is not
 	// checked; the nonce and the queue apply as usual.

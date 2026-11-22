@@ -1,6 +1,6 @@
 // Package demo is the public demo site: a page showing recent payments,
-// statistics over the whole payment record (our own test wallets counted
-// apart), the live chain head and the prices of the demo routes.
+// statistics over the payment record of the routes it lists (our own test
+// wallets counted apart), the live chain head and the prices of the demo routes.
 //
 // Its numbers come from the payment record (receipts in PostgreSQL), never
 // from the gateway's monitoring metrics: those belong to whatever
@@ -9,12 +9,15 @@
 package demo
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"embed"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
 	"sort"
@@ -42,7 +45,9 @@ type Route struct {
 	URL  string `json:"url"`
 	Note string `json:"note,omitempty"`
 	// Key is the HTTPRoute as "namespace/name", as receipts record it, so the
-	// page can name feed rows. Optional.
+	// page can name feed rows. When any route has a key, the feed, totals and
+	// statistics count only the routes listed here: the receipts table also
+	// holds every other route the gateway prices. Optional.
 	Key string `json:"key,omitempty"`
 }
 
@@ -113,11 +118,16 @@ func (s *Server) Handler() http.Handler {
 	s.cacheOK = 3 * time.Second
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		// 'self' scripts: the coin slot (three.js) is served from /assets.
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'")
-		w.Write(pageHTML)
+		w.Write(s.page(r.Context()))
+	})
+	mux.HandleFunc("GET /llms.txt", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "public, max-age=60")
+		io.WriteString(w, s.llmsTxt(r.Context(), "https://"+r.Host))
 	})
 	static := http.FileServerFS(assets)
 	mux.HandleFunc("GET /assets/{file}", func(w http.ResponseWriter, r *http.Request) {
@@ -128,7 +138,28 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("Cache-Control", "public, max-age=86400")
 		http.ServeFileFS(w, r, assets, "assets/favicon.ico")
 	})
-	mux.HandleFunc("GET /api/feed", s.cache("feed", s.cacheOK, s.feed))
+	feedAll := s.cache("feed", s.cacheOK, s.feed)
+	mux.HandleFunc("GET /api/feed", func(w http.ResponseWriter, r *http.Request) {
+		payer := strings.ToLower(r.URL.Query().Get("payer"))
+		if payer == "" {
+			feedAll(w, r)
+			return
+		}
+		// One payer's own receipts: an async route answers before it
+		// settles, so this is where its transaction shows up.
+		if pgTextArray([]string{payer}) == "{}" {
+			http.Error(w, `{"error":"payer: a 0x address"}`, http.StatusBadRequest)
+			return
+		}
+		ps, err := s.feedFor(r.Context(), payer)
+		if err != nil {
+			http.Error(w, `{"error":"temporarily unavailable"}`, http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		json.NewEncoder(w).Encode(ps)
+	})
 	mux.HandleFunc("GET /api/stats", s.cache("stats", s.cacheOK, s.stats))
 	mux.HandleFunc("GET /api/routes", s.cache("routes", s.cacheOK, s.routes))
 	mux.HandleFunc("GET /api/totals", s.cache("totals", s.cacheOK, s.totals))
@@ -217,8 +248,9 @@ func (s *Server) totals(ctx context.Context) (any, error) {
 	}
 	rows, err := s.DB.QueryContext(ctx, `
 SELECT chain, count(*), coalesce(sum(amount), 0)::text
-FROM x402_receipts WHERE (status = 'settled' AND tx_hash <> '') OR status = 'batch_charged'
-GROUP BY chain ORDER BY chain`)
+FROM x402_receipts WHERE ((status = 'settled' AND tx_hash <> '') OR status = 'batch_charged')
+  AND ($1::text[] = '{}' OR route = ANY($1::text[]))
+GROUP BY chain ORDER BY chain`, s.routeKeys())
 	if err != nil {
 		return nil, err
 	}
@@ -249,7 +281,11 @@ type Payment struct {
 
 // feed lists recent settled payments. Only payments with a transaction hash
 // are shown: every row must resolve on the explorer.
-func (s *Server) feed(ctx context.Context) (any, error) {
+func (s *Server) feed(ctx context.Context) (any, error) { return s.feedFor(ctx, "") }
+
+// feedFor lists recent settled payments, of one payer (lowercase address)
+// or of everyone ("").
+func (s *Server) feedFor(ctx context.Context, payer string) ([]Payment, error) {
 	out := []Payment{}
 	if s.DB == nil {
 		return out, nil
@@ -257,7 +293,9 @@ func (s *Server) feed(ctx context.Context) (any, error) {
 	rows, err := s.DB.QueryContext(ctx, `
 SELECT recorded_at, route, amount::text, chain, payer, tx_hash, block
 FROM x402_receipts WHERE status = 'settled' AND tx_hash <> ''
-ORDER BY id DESC LIMIT 25`)
+  AND ($1::text[] = '{}' OR route = ANY($1::text[]))
+  AND ($2 = '' OR lower(payer) = $2)
+ORDER BY id DESC LIMIT 25`, s.routeKeys(), payer)
 	if err != nil {
 		return nil, err
 	}
@@ -285,7 +323,7 @@ type RouteTerms struct {
 	Terms  *x402.PaymentRequired `json:"terms,omitempty"`
 }
 
-// Stats are the whole payment record so far, over all routes.
+// Stats are the payment record so far, over the listed routes.
 type Stats struct {
 	Answered int64 `json:"answered"` // paid requests the API answered
 	Settled  int64 `json:"settled"`  // settled on chain, with a transaction
@@ -318,7 +356,7 @@ SELECT count(*) FILTER (WHERE status IN ('served', 'batch_charged')),
        coalesce(percentile_cont(0.5) WITHIN GROUP (ORDER BY greatest(0, extract(epoch FROM recorded_at - served_at)))
                 FILTER (WHERE status = 'settled' AND tx_hash <> '' AND served_at IS NOT NULL), 0),
        min(recorded_at) FILTER (WHERE status = 'served')
-FROM x402_receipts`, pgTextArray(s.OwnPayers)).
+FROM x402_receipts WHERE $2::text[] = '{}' OR route = ANY($2::text[])`, pgTextArray(s.OwnPayers), s.routeKeys()).
 		Scan(&st.Answered, &st.Settled, &st.Unpaid, &st.Payers, &st.OtherPayers, &st.SettleSeconds, &st.Since)
 	st.OwnPayers = st.Payers - st.OtherPayers
 	return st, err
@@ -420,6 +458,25 @@ func (s *Server) own(payer string) bool {
 	return false
 }
 
+// routeKeys is the listed routes' keys as a PostgreSQL text[] literal, or
+// '{}' (every route) when none has a key. Keys are "namespace/name" of
+// Kubernetes names; anything else is left out, never quoted into SQL.
+func (s *Server) routeKeys() string {
+	var ok []string
+	keyed := false
+	for _, r := range s.Routes {
+		keyed = keyed || r.Key != ""
+		ns, name, found := strings.Cut(r.Key, "/")
+		if found && ns != "" && name != "" && strings.Trim(ns+name, "abcdefghijklmnopqrstuvwxyz0123456789-.") == "" {
+			ok = append(ok, r.Key)
+		}
+	}
+	if keyed && len(ok) == 0 {
+		return `{""}` // keys, none usable: match nothing rather than everything
+	}
+	return "{" + strings.Join(ok, ",") + "}"
+}
+
 // pgTextArray renders addresses as a PostgreSQL text[] literal for = ANY($1).
 // Addresses are 0x and hex only; anything else is left out.
 func pgTextArray(addrs []string) string {
@@ -431,4 +488,149 @@ func pgTextArray(addrs []string) string {
 		}
 	}
 	return "{" + strings.Join(ok, ",") + "}"
+}
+
+// cachedRoutes is the menu, from the shared cache when fresh (the page and
+// llms.txt must not multiply route checks).
+func (s *Server) cachedRoutes(ctx context.Context) []RouteTerms {
+	s.mu.Lock()
+	e, ok := s.cached["routes"]
+	s.mu.Unlock()
+	var rs []RouteTerms
+	if ok && time.Since(e.at) <= s.cacheOK && json.Unmarshal(e.body, &rs) == nil {
+		return rs
+	}
+	v, err := s.routes(ctx)
+	if err != nil {
+		return nil
+	}
+	rs, _ = v.([]RouteTerms)
+	if body, err := json.Marshal(rs); err == nil {
+		s.mu.Lock()
+		s.cached["routes"] = cacheEntry{at: time.Now(), body: body}
+		s.mu.Unlock()
+	}
+	return rs
+}
+
+// priceOf describes a route's first offer, like "$0.001 in USDC on
+// eip155:84532", or "" when it has none.
+func priceOf(r RouteTerms) (string, string) {
+	if r.Terms == nil || len(r.Terms.Accepts) == 0 {
+		return "", ""
+	}
+	a := r.Terms.Accepts[0]
+	return usd(a.Amount) + " in USDC", a.Network
+}
+
+// usd renders a USDC amount in atomic units (6 decimals) as dollars.
+func usd(atomic string) string {
+	n := new(big.Int)
+	if _, ok := n.SetString(atomic, 10); !ok {
+		return atomic + " units"
+	}
+	f, _ := new(big.Rat).SetFrac(n, big.NewInt(1_000_000)).Float64()
+	return "$" + strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.6f", f), "0"), ".")
+}
+
+var networkNames = map[string]string{"eip155:8453": "Base", "eip155:84532": "Base Sepolia (test USDC)"}
+
+// page is the demo page with the menu already in the HTML, for agents and
+// readers that do not run JavaScript; the script replaces it with the live
+// one.
+func (s *Server) page(ctx context.Context) []byte {
+	rs := s.cachedRoutes(ctx)
+	if len(rs) == 0 {
+		return pageHTML
+	}
+	var b strings.Builder
+	for _, r := range rs {
+		b.WriteString(`<li class="item"><h3>` + html.EscapeString(r.Name) + `</h3>`)
+		if p, n := priceOf(r); p != "" {
+			b.WriteString(`<p>` + html.EscapeString(p+" on "+nameOf(n)) + `</p>`)
+		}
+		if r.Note != "" {
+			b.WriteString(`<p>` + html.EscapeString(r.Note) + `</p>`)
+		}
+		b.WriteString(`<p><a href="` + html.EscapeString(r.URL) + `">` + html.EscapeString(r.URL) + `</a></p></li>`)
+	}
+	out := bytes.Replace(pageHTML, []byte(`<li class="item"><p>Loading the menu…</p></li>`), []byte(b.String()), 1)
+	// The commands in "How to pay" name the sandbox route (else the first
+	// priced one), as the script would.
+	if u := sampleURL(rs); u != "" {
+		e := []byte(html.EscapeString(u))
+		out = bytes.Replace(out, []byte(`<code id="cmdAsk">curl -i …</code>`), []byte(`<code id="cmdAsk">curl -i &#34;`+string(e)+`&#34;</code>`), 1)
+		out = bytes.ReplaceAll(out, []byte("{URL}"), e)
+	}
+	return out
+}
+
+// sampleURL is the route the page's commands use: a testnet one first.
+func sampleURL(rs []RouteTerms) string {
+	for _, r := range rs {
+		if _, n := priceOf(r); n == "eip155:84532" {
+			return r.URL
+		}
+	}
+	for _, r := range rs {
+		if r.Priced {
+			return r.URL
+		}
+	}
+	if len(rs) > 0 {
+		return rs[0].URL
+	}
+	return ""
+}
+
+func nameOf(network string) string {
+	if n := networkNames[network]; n != "" {
+		return n
+	}
+	return network
+}
+
+// llmsTxt tells agents what they can call here and how to pay, from the
+// configured routes and their current prices.
+func (s *Server) llmsTxt(ctx context.Context, origin string) string {
+	var b strings.Builder
+	b.WriteString("# x402 demo\n\n")
+	b.WriteString("> APIs paid per request over x402 (HTTP 402 Payment Required), in USDC: no account and no API key. An unpaid request gets 402 with the terms in the PAYMENT-REQUIRED header; sign a USDC authorization (EIP-3009) for exactly that amount with any x402 client and send the request again.\n\n")
+	var test, real []RouteTerms
+	for _, r := range s.cachedRoutes(ctx) {
+		if _, n := priceOf(r); n == "eip155:84532" {
+			test = append(test, r)
+		} else {
+			real = append(real, r)
+		}
+	}
+	line := func(r RouteTerms) {
+		p, n := priceOf(r)
+		b.WriteString("- [" + r.Name + "](" + r.URL + ")")
+		if p != "" {
+			b.WriteString(": " + p + " on " + nameOf(n))
+		}
+		if r.Note != "" {
+			b.WriteString(". " + r.Note)
+		}
+		b.WriteString("\n")
+	}
+	if len(test) > 0 {
+		b.WriteString("## Sandbox (test USDC, start here)\n\n")
+		for _, r := range test {
+			line(r)
+		}
+		b.WriteString("\nPays in test USDC on Base Sepolia (eip155:84532); no ETH is needed, the facilitator pays the gas. Test USDC is free from Circle's faucet, https://faucet.circle.com (a web page with a captcha: an agent needs its owner to request it), or from the CDP faucet API with a Coinbase Developer Platform account. Register your client for eip155:84532 only, so the same key cannot pay on mainnet by mistake.\n\n")
+	}
+	if len(real) > 0 {
+		b.WriteString("## Paid APIs (real USDC)\n\n")
+		for _, r := range real {
+			line(r)
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("## Receipts\n\n")
+	b.WriteString("A route that answers first settles about a second later, so its PAYMENT-RESPONSE header carries no transaction yet. Your settled payments, with their transactions: " + origin + "/api/feed?payer=<your address>\n\n")
+	b.WriteString("## Clients\n\n- TypeScript: @x402/fetch with @x402/evm\n- Python: the x402 package (pip install \"x402[requests,evm]\" httpx: it needs httpx but does not install it)\n- Go: github.com/x402-foundation/x402/go/v2\n- CLI: go install apivend.io/apivend/cmd/x402-pay@latest\n")
+	return b.String()
 }

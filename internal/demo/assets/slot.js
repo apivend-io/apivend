@@ -282,14 +282,15 @@ if (frozen) {
   new IntersectionObserver(([e]) => { visible = e.isIntersecting; }).observe(stage);
   const watching = () => visible && !document.hidden;
 
-  // settle(payments, onPrint): called once per check of the feed, with the
-  // payments that settled since the last one (newest first) and a callback
-  // that prints receipts. The animation never falls behind the chain:
-  //   1 payment     the coin drops with a tag; its receipt prints as it enters
-  //   2-5           the coin, then one coin each; each receipt as its coin enters
-  //   more          a pour of up to 12 coins; every receipt prints at once
-  // During a run, or when nobody is watching, receipts print at once (a run
-  // in progress just gets more coins).
+  // settle(payments, onPrint, label): called once per check of the feed,
+  // with the payments that settled since the last one (newest first) and a
+  // callback that prints receipts. One coin per check, however many
+  // settled: its tag says how many, and their receipts print as it enters
+  // the slot. Payments that arrive during a run print at once and raise the
+  // count on the tag; they never add coins (several coins at once read as
+  // noise, not as payments). When nobody is watching, receipts print at
+  // once.
+  const tagText = (n, label) => n === 1 && label ? label : n.toLocaleString('en-US') + ' payments settled';
   window.apivendSlot = {
     settle(payments, onPrint, label) {
       if (!payments.length) return;
@@ -297,25 +298,16 @@ if (frozen) {
       const now = performance.now();
       if (run) {
         onPrint(payments);
-        const d = (now - run.at) / 1000;
-        for (let i = 0; i < Math.min(payments.length, POOL - run.followers.length); i++)
-          run.followers.push({ start: d + 0.08 * i, seed: Math.random(), payments: [] });
-        run.newAt = Math.max(run.newAt, ...run.followers.map(f => f.start + 0.75));
+        run.count += payments.length;
+        tag.textContent = tagText(run.count, null);
         return;
       }
-      const pour = payments.length > 5;
-      const followers = [];
-      if (payments.length > 1) {
-        const n = Math.min(payments.length - 1, POOL), gap = pour ? 0.08 : 0.32;
-        for (let i = 0; i < n; i++) followers.push({ start: INS + 0.3 + gap * i, seed: Math.random(), payments: pour ? [] : [payments[i + 1]] });
-      }
       run = {
-        at: now, spinAtDrop: (now - t0) / 1000 * RATE, followers, onPrint,
-        first: pour ? payments : [payments[0]], printed: false,
-        newAt: Math.max(NEW_AT, ...followers.map(f => f.start + 0.75)),
-        label: payments.length === 1 ? label : null,
+        at: now, spinAtDrop: (now - t0) / 1000 * RATE, followers: [], onPrint,
+        first: payments, printed: false, newAt: NEW_AT, count: payments.length,
+        label: tagText(payments.length, label),
       };
-      if (run.label) { tag.textContent = run.label; tag.hidden = false; }
+      tag.textContent = run.label; tag.hidden = false;
       // Receipts never wait on the animation: if frames stop (a throttled
       // tab that still counts as visible), everything prints after 8 s.
       const mine = run;

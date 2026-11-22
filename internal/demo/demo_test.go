@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -69,9 +70,15 @@ func TestDemoAPIs(t *testing.T) {
 		{"a", "served", "", "0x11d0dcb977c973731215d7005665159d21faf0c5"}, {"a", "settled", "0xabc", "0x11d0dcb977c973731215d7005665159d21faf0c5"},
 		{"b", "served", "", "0x11d0dcb977c973731215d7005665159d21faf0c5"}, {"b", "settled", "", "0x11d0dcb977c973731215d7005665159d21faf0c5"},
 		{"c", "served", "", "0x744d86e964064e45db518bbc6c1ab91ce92241c4"}, {"c", "unpaid", "", "0x744d86e964064e45db518bbc6c1ab91ce92241c4"},
+		// A seller's endpoint on the same gateway: not one of the demo's
+		// routes, so it is on no tape, total or count.
+		{"d", "served", "", "0x9965507d1a55bcc2695c58ba16fb37d819b0a4dc"}, {"d", "settled", "0xdef", "0x9965507d1a55bcc2695c58ba16fb37d819b0a4dc"},
 	} {
 		rc := base
 		rc.ReservationID, rc.Status, rc.TxHash, rc.Payer = r.id, r.status, r.tx, r.payer
+		if r.id == "d" {
+			rc.Route = "t-geo/route-1"
+		}
 		if err := store.Record(context.Background(), rc); err != nil {
 			t.Fatal(err)
 		}
@@ -79,7 +86,7 @@ func TestDemoAPIs(t *testing.T) {
 
 	srv := httptest.NewServer((&demo.Server{
 		DB:        store.DB(),
-		Routes:    []demo.Route{{Name: "search", URL: priced.URL}, {Name: "hello", URL: free.URL, Note: "policy deleted"}},
+		Routes:    []demo.Route{{Name: "search", URL: priced.URL, Key: "demo/search"}, {Name: "hello", URL: free.URL, Note: "policy deleted"}},
 		OwnPayers: []string{"0x11d0dcb977c973731215d7005665159d21faf0c5", "not-an-address'); DROP TABLE x402_receipts; --"},
 	}).Handler())
 	defer srv.Close()
@@ -99,6 +106,37 @@ func TestDemoAPIs(t *testing.T) {
 	getJSON(t, srv.URL+"/api/feed", &feed)
 	if len(feed) != 1 || feed[0].TxHash != "0xabc" || feed[0].TxURL != "https://sepolia.basescan.org/tx/0xabc" || feed[0].Amount != "1000" || !feed[0].Own {
 		t.Fatalf("feed = %+v", feed)
+	}
+
+	// One payer's own receipts; a malformed address is refused.
+	getJSON(t, srv.URL+"/api/feed?payer=0x11D0DCB977C973731215D7005665159D21FAF0C5", &feed)
+	if len(feed) != 1 || feed[0].TxHash != "0xabc" {
+		t.Fatalf("feed for a payer = %+v", feed)
+	}
+	getJSON(t, srv.URL+"/api/feed?payer=0x744d86e964064e45db518bbc6c1ab91ce92241c4", &feed)
+	if len(feed) != 0 {
+		t.Fatalf("feed for a payer with nothing settled = %+v", feed)
+	}
+	if resp, err := http.Get(srv.URL + "/api/feed?payer=nobody'--"); err != nil || resp.StatusCode != 400 {
+		t.Fatalf("bad payer: %v %v", resp, err)
+	}
+
+	// The menu is in the HTML for readers without JavaScript, and llms.txt
+	// names the sandbox, its price and where receipts are.
+	page := getText(t, srv.URL+"/")
+	if !strings.Contains(page, ">search</h3>") || !strings.Contains(page, `href="`+priced.URL+`"`) || strings.Contains(page, "Loading the menu") {
+		t.Fatalf("server-rendered menu missing:\n%s", page[:min(len(page), 400)])
+	}
+	// Without JavaScript the commands and snippets name a real route, and
+	// the page points agents at llms.txt.
+	if strings.Contains(page, "{URL}") || strings.Contains(page, "curl -i …") || !strings.Contains(page, `curl -i &#34;`+priced.URL+`&#34;`) || !strings.Contains(page, `href="/llms.txt"`) {
+		t.Fatalf("commands not filled in, or no llms.txt link")
+	}
+	llms := getText(t, srv.URL+"/llms.txt")
+	for _, want := range []string{"## Sandbox", "[search](" + priced.URL + "): $0.001 in USDC on Base Sepolia", "/api/feed?payer=", "eip155:84532 only"} {
+		if !strings.Contains(llms, want) {
+			t.Fatalf("llms.txt lacks %q:\n%s", want, llms)
+		}
 	}
 
 	// Only settled payments with a transaction count, per network.
@@ -293,4 +331,15 @@ func TestRoutesFromPriceTable(t *testing.T) {
 		routes[0].Terms.Resource.URL != never.URL+"/v1/name-check" {
 		t.Fatalf("terms = %+v", routes[0].Terms)
 	}
+}
+
+func getText(t *testing.T, url string) string {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("GET %s: %v %v", url, resp, err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return string(b)
 }

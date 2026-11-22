@@ -31,6 +31,9 @@ type Offer struct {
 	// MaxUnsettled caps a payer's unsettled exposure on this asset (atomic
 	// units); nil means no cap.
 	MaxUnsettled *big.Int
+	// MaxUnsettledPerRoute caps the route's served-but-unsettled amount
+	// across payers (atomic units); nil means no cap.
+	MaxUnsettledPerRoute *big.Int
 	// Batch is set on batch-settlement offers.
 	Batch *BatchTerms
 }

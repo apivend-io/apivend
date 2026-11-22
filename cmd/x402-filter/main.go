@@ -37,7 +37,8 @@ func main() {
 		configMap       = flag.String("config-configmap", "", "read the price table from this ConfigMap through the Kubernetes API instead of -config, so every replica sees a change within about a second (a mounted ConfigMap takes up to a minute, at a different moment in each pod)")
 		configKey       = flag.String("config-configmap-key", "routes.yaml", "key of the price table in -config-configmap")
 		configNS        = flag.String("config-namespace", "", "namespace of -config-configmap; default env POD_NAMESPACE, then the pod's own namespace")
-		minRemaining    = flag.Duration("min-validity-remaining", 10*time.Second, "reject authorizations that expire sooner than this")
+		refuseUnpriced  = flag.String("refuse-unpriced-routes", "", "comma-separated Envoy route-name patterns that are always priced, per-segment globs (e.g. httproute/t-*/p-*): such a route missing from the price table is refused, not served free")
+		minRemaining    = flag.Duration("min-validity-remaining", 30*time.Second, "reject authorizations that expire sooner than this")
 		redisAddr       = flag.String("redis", os.Getenv("X402_REDIS"), "Redis address or URL for shared payer state (env X402_REDIS); empty = in-memory, single replica")
 		readTimeout     = flag.Duration("chain-read-timeout", 300*time.Millisecond, "budget for the synchronous balance read of an unknown payer, across all state sources (hedged)")
 		warmEvery       = flag.Duration("rpc-keep-warm", 20*time.Second, "call every -rpc endpoint this often so a connection stays open and a cold read does not spend -chain-read-timeout on connection setup; 0 disables")
@@ -49,6 +50,7 @@ func main() {
 		hostedKeyFile   = flag.String("hosted-state-key-file", "", "file holding the hosted service API key (or env X402_HOSTED_STATE_KEY)")
 		rpcs            = cliutil.RPCFlag{}
 		factories       = flag.String("eip6492-factories", "", "comma-separated smart-wallet factories allowed to deploy an ERC-6492 wallet during verification (simulated only); default: Coinbase Smart Wallet v1.1 and v1")
+		contractRate    = flag.Float64("contract-wallet-checks-per-second", 10, "RPC calls a second that contract-wallet signature checks may make, across all payers (bursts of twice that); past it such payments get 503 and may retry. Payer-key signatures never use it")
 		contractTimeout = flag.Duration("contract-wallet-timeout", time.Second, "how long a contract-wallet signature check (EIP-1271 eth_call) may take; only payments whose signature is not the payer's own key wait on it")
 	)
 	flag.Var(rpcs, "rpc", "chain RPC endpoints as network=url[,url...]; repeatable. Networks without one get no balance checks")
@@ -165,7 +167,8 @@ func main() {
 			log.Error("configure rpc", "err", err)
 			os.Exit(1)
 		}
-		cc := &verify.ChainChecker{Chains: map[string]verify.Caller{}, Timeout: *contractTimeout}
+		cc := &verify.ChainChecker{Chains: map[string]verify.Caller{}, Timeout: *contractTimeout,
+			PerSecond: *contractRate, Burst: int(2 * *contractRate)}
 		for _, f := range strings.Split(*factories, ",") {
 			if f = strings.TrimSpace(f); f == "" {
 				continue
@@ -191,7 +194,13 @@ func main() {
 			channels = payerstate.NewChannels(stateRedis, payerstate.ChainChannelReader(chans))
 		}
 	}
-	srv := extproc.NewServer(table, state, extproc.Options{Logger: log, MinRemaining: *minRemaining, Metrics: m, Contract: contract, Channels: channels})
+	var refuse []string
+	for _, p := range strings.Split(*refuseUnpriced, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			refuse = append(refuse, p)
+		}
+	}
+	srv := extproc.NewServer(table, state, extproc.Options{Logger: log, MinRemaining: *minRemaining, Metrics: m, Contract: contract, Channels: channels, RefuseUnpriced: refuse})
 
 	lis, err := net.Listen("tcp", *listen)
 	if err != nil {

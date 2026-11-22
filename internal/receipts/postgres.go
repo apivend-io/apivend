@@ -40,9 +40,10 @@ CREATE INDEX IF NOT EXISTS x402_receipts_request ON x402_receipts (request_id) W
 -- Time windows (the demo's 24-hour statistics and totals).
 CREATE INDEX IF NOT EXISTS x402_receipts_recorded ON x402_receipts (recorded_at);
 
--- Current state of each reservation: its most recent row.
-DROP VIEW IF EXISTS x402_receipts_current;
-CREATE VIEW x402_receipts_current AS
+-- Current state of each reservation: its most recent row. Replaced, not
+-- dropped, so that grants on it (a read-only role) survive a restart;
+-- columns are only ever added at the end, which a replace allows.
+CREATE OR REPLACE VIEW x402_receipts_current AS
 SELECT DISTINCT ON (reservation_id) *
 FROM x402_receipts
 ORDER BY reservation_id, id DESC;

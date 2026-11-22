@@ -9,6 +9,15 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
+{{/* Pod template labels: without helm.sh/chart, so an upgrade that changes
+only the chart's version (GitOps tools add the commit to it) does not
+restart every pod. */}}
+{{- define "x402.podLabels" -}}
+app.kubernetes.io/name: x402
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end }}
+
 {{- define "x402.redisEnv" -}}
 - name: X402_REDIS
 {{- if .Values.redis.existingSecret.name }}

@@ -54,7 +54,7 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "x402.labels" . | nindent 8 }}
+        {{- include "x402.podLabels" . | nindent 8 }}
         app.kubernetes.io/component: settler
       {{- if .Values.metrics.annotations }}
       annotations:

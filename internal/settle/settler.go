@@ -3,7 +3,9 @@ package settle
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
+	"math/big"
 	"strings"
 	"sync"
 	"time"
@@ -184,10 +186,19 @@ func (s *Settler) handle(ctx context.Context, c *payerstate.Claimed) {
 	// Check before retrying: the on-chain nonce is the source of truth. A
 	// previous attempt may have landed even though it looked like a failure.
 	if reader != nil && (c.Attempt > 1 || expired) {
-		used, err := s.authorizationUsed(ctx, reader, asset, payer, nonce)
+		out, err := s.authorizationOutcome(ctx, reader, asset, payer, nonce, job.StateBlock, expectedTransfer(&job))
 		switch {
-		case err == nil && used:
+		case err == nil && out == authTransferred:
 			s.finishSettled(ctx, log, c, &job, rc, known, "", "confirmed_on_chain")
+			return
+		case err == nil && out == authCanceled:
+			// The payer cancelled the authorization after presenting it:
+			// served and not paid for, by the payer's own doing.
+			s.finishUnpaid(ctx, log, c, &job, rc, "authorization_canceled", job.Kind == "")
+			return
+		case err == nil && out == authPreempted:
+			// The payer spent the nonce on another transfer first.
+			s.finishUnpaid(ctx, log, c, &job, rc, "authorization_preempted", job.Kind == "")
 			return
 		case err != nil && expired:
 			if c.Attempt > s.MaxAttempts+6 {
@@ -239,6 +250,7 @@ func (s *Settler) handle(ctx context.Context, c *payerstate.Claimed) {
 	// one is cooling down, all are tried anyway rather than none.
 	tried := false
 	refusedReason, lastReason := "", "no_backend"
+backends:
 	for pass := 0; pass < 2 && !tried; pass++ {
 		for _, b := range capable {
 			if pass == 0 && !s.health.allow(b.Name(), s.Now()) {
@@ -273,6 +285,11 @@ func (s *Settler) handle(ctx context.Context, c *payerstate.Claimed) {
 			case Refused:
 				log.Warn("settlement refused", "provider", b.Name(), "reason", res.Reason)
 				refusedReason = res.Reason
+				// A refusal is an answer about this payment (a facilitator
+				// may refuse a payer it screens out): the next backend is
+				// not asked to overrule it. Only an unavailable backend
+				// fails over.
+				break backends
 			case Unavailable:
 				log.Warn("settlement backend unavailable", "provider", b.Name(), "reason", res.Reason)
 				lastReason = res.Reason
@@ -281,10 +298,18 @@ func (s *Settler) handle(ctx context.Context, c *payerstate.Claimed) {
 	}
 
 	if refusedReason != "" {
-		// A refusal can mean "already used" after a transfer that did land.
+		// A refusal can mean "already used" after a transfer that did land,
+		// or that the payer cancelled the authorization.
 		if reader != nil {
-			if used, err := s.authorizationUsed(ctx, reader, asset, payer, nonce); err == nil && used {
+			switch out, err := s.authorizationOutcome(ctx, reader, asset, payer, nonce, job.StateBlock, expectedTransfer(&job)); {
+			case err == nil && out == authTransferred:
 				s.finishSettled(ctx, log, c, &job, rc, known, "", "confirmed_on_chain")
+				return
+			case err == nil && out == authCanceled:
+				s.finishUnpaid(ctx, log, c, &job, rc, "authorization_canceled", job.Kind == "")
+				return
+			case err == nil && out == authPreempted:
+				s.finishUnpaid(ctx, log, c, &job, rc, "authorization_preempted", job.Kind == "")
 				return
 			}
 		}
@@ -300,6 +325,117 @@ func (s *Settler) handle(ctx context.Context, c *payerstate.Claimed) {
 	}
 	log.Info("settlement will be retried", "reason", lastReason, "in", backoff(c.Attempt).String())
 	s.Queue.Retry(ctx, c.ID, backoff(c.Attempt))
+}
+
+type authOutcome int
+
+const (
+	authOpen        authOutcome = iota // nonce unused on chain
+	authTransferred                    // AuthorizationUsed: the transfer landed
+	authCanceled                       // AuthorizationCanceled: the payer withdrew it
+	// authPreempted: the nonce was used by a transfer that is not this
+	// payment (another recipient or amount): the payer spent it elsewhere
+	// first, after being served.
+	authPreempted
+)
+
+// wantTransfer is the transfer a payment's authorization must have made.
+type wantTransfer struct {
+	to     evm.Address
+	amount *big.Int
+}
+
+// expectedTransfer is a payment's: to the route's payTo, its exact amount.
+// Batch jobs (deposits into escrow, refunds, claims) have none.
+func expectedTransfer(job *Job) *wantTransfer {
+	if job.Kind != "" {
+		return nil
+	}
+	to, err := evm.ParseAddress(job.Requirements.PayTo)
+	amount, ok := new(big.Int).SetString(job.Amount, 10)
+	if err != nil || !ok {
+		return nil
+	}
+	return &wantTransfer{to: to, amount: amount}
+}
+
+// nonceEvents is implemented by chain.RPC and chain.Fake.
+type nonceEvents interface {
+	Head(ctx context.Context) (uint64, string, error)
+	NonceEvents(ctx context.Context, token, authorizer evm.Address, nonce [32]byte, from, to uint64) ([]chain.AuthEvent, error)
+	TransferAfter(ctx context.Context, txHash string, token evm.Address, logIndex uint64) (chain.TransferLog, bool, error)
+}
+
+// authorizationOutcome tells a used authorization from a cancelled one.
+// USDC's authorizationState is true for both, so a used nonce counts as
+// paid only when its AuthorizationUsed log is found (searched back from the
+// head, in 200-block windows, to a little before the block the payment's
+// balance check rested on). Not finding it is an error: never "settled"
+// without proof. For a payment (want), the AuthorizationUsed log proves it
+// only together with the token's next log in the same transaction: the
+// Transfer from the payer to want.to of exactly want.amount. Anything else
+// means the payer used the nonce on another transfer first (preempted).
+func (s *Settler) authorizationOutcome(ctx context.Context, reader chain.Reader, asset, payer, nonce string, sinceBlock uint64, want *wantTransfer) (authOutcome, error) {
+	used, err := s.authorizationUsed(ctx, reader, asset, payer, nonce)
+	if err != nil || !used {
+		return authOpen, err
+	}
+	ev, ok := reader.(nonceEvents)
+	if !ok {
+		return authOpen, errors.New("authorization used, but this chain reader cannot tell a transfer from a cancellation")
+	}
+	token, _ := evm.ParseAddress(asset)
+	owner, _ := evm.ParseAddress(payer)
+	n, _ := evm.ParseBytes32(nonce)
+	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	head, _, err := ev.Head(cctx)
+	if err != nil {
+		return authOpen, err
+	}
+	const window, maxWindows = 200, 100 // about 11 hours of Base blocks
+	floor := uint64(0)
+	if sinceBlock > 50 {
+		floor = sinceBlock - 50
+	}
+	if head > window*maxWindows && floor < head-window*maxWindows {
+		floor = head - window*maxWindows
+	}
+	for to := head; ; {
+		from := floor
+		if to >= window && to-window+1 > floor {
+			from = to - window + 1
+		}
+		evs, err := ev.NonceEvents(cctx, token, owner, n, from, to)
+		if err != nil {
+			return authOpen, err
+		}
+		for _, e := range evs {
+			if e.Nonce == n && e.Authorizer == owner {
+				if e.Canceled {
+					return authCanceled, nil
+				}
+				if want == nil {
+					return authTransferred, nil
+				}
+				if e.TxHash == "" {
+					return authOpen, errors.New("authorization used, but its log has no transaction to check the transfer in")
+				}
+				t, found, err := ev.TransferAfter(cctx, e.TxHash, token, e.LogIndex)
+				if err != nil {
+					return authOpen, err
+				}
+				if found && t.From == owner && t.To == want.to && t.Value.Cmp(want.amount) == 0 {
+					return authTransferred, nil
+				}
+				return authPreempted, nil
+			}
+		}
+		if from <= floor {
+			return authOpen, errors.New("authorization used, but neither its transfer nor its cancellation was found")
+		}
+		to = from - 1
+	}
 }
 
 func (s *Settler) authorizationUsed(ctx context.Context, reader chain.Reader, asset, payer, nonce string) (bool, error) {

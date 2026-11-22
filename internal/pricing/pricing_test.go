@@ -192,3 +192,20 @@ func TestDiscovery(t *testing.T) {
 		}
 	}
 }
+
+func TestMaxUnsettledPerRoute(t *testing.T) {
+	r := route("search", "/search")
+	table, err := Build(Config{Routes: []RouteConfig{r}})
+	if err != nil || table.Route("search").Offers[0].MaxUnsettledPerRoute != nil {
+		t.Fatalf("no cap by default: %v", err)
+	}
+	r.Settlement.MaxUnsettledPerRoute = "5.00"
+	table, err = Build(Config{Routes: []RouteConfig{r}})
+	if err != nil || table.Route("search").Offers[0].MaxUnsettledPerRoute.String() != "5000000" {
+		t.Fatalf("cap: %v", err)
+	}
+	r.Settlement.MaxUnsettledPerRoute = "0.001"
+	if _, err := Build(Config{Routes: []RouteConfig{r}}); err == nil || !strings.Contains(err.Error(), "below the price") {
+		t.Fatalf("cap below the price: %v", err)
+	}
+}

@@ -44,10 +44,17 @@ filter:
   replicas: 2
   # Blocks a balance increase must age before it counts (direct RPC source).
   creditConfirmations: 0
-  minValidityRemaining: 10s
+  # Room for the backend to answer and the payment to settle before the
+  # authorization lapses: shorter-lived ones are refused up front.
+  minValidityRemaining: 30s
   # Budget for a new payer's balance read, across all state sources. One
   # read is 40-80 ms against public Base Sepolia RPCs from Europe.
   chainReadTimeout: 300ms
+  # Envoy route-name patterns that must always be priced, per-segment globs
+  # (for example "httproute/t-*/p-*": routes p-* in namespaces t-*). With the filter also
+  # attached to the listener those routes use, a route whose PaymentPolicy
+  # is missing or rejected is refused instead of served free.
+  refuseUnpricedRoutes: []
   resources: {}
 
 settler:
@@ -75,6 +82,11 @@ controller:
   batch:
     receiverAuthorizer: ""
     withdrawDelay: 86400
+  # Served-but-unsettled cap per async route, across all payers, in USD, for
+  # PaymentPolicies that set no settlement.maxUnsettledPerRoute (never below
+  # a route's price). Payer addresses are free, so the per-payer cap alone
+  # does not bound a seller's loss. Empty: no cap.
+  defaultMaxUnsettledPerRoute: ""
   resources: {}
 
 # Adds prometheus.io/* scrape annotations to the pods.

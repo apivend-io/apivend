@@ -160,7 +160,8 @@ drained() { for _ in $(seq 1 80); do [[ "$(rcli zcard x402:settle:queue)" = 0 ]]
 check "free route passes through"          test "$(status $GW/free)" = 200
 check "priced route answers 402"           test "$(status $GW/search)" = 402
 check "402 carries PAYMENT-REQUIRED"       bash -c "curl -s -D- -o /dev/null $GW/search | grep -qi '^payment-required: '"
-check "preflight is not charged"           test "$(status -X OPTIONS $GW/search)" != 402
+check "preflight answered, not charged"    test "$(status -X OPTIONS -H 'Origin: https://app.example' -H 'Access-Control-Request-Method: GET' $GW/search)" = 204
+check "plain OPTIONS is priced"           test "$(status -X OPTIONS $GW/search)" = 402
 check "garbage payment answers 400"        test "$(status -H 'PAYMENT-SIGNATURE: %%%' $GW/search)" = 400
 
 out=$(bin/x402-pay "$GW/search?q=hello" 2>"$LOGS/pay.err") || true

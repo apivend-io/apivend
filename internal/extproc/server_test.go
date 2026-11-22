@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"google.golang.org/protobuf/types/known/structpb"
 	"io"
 	"log/slog"
 	"net"
@@ -41,10 +42,13 @@ type spyState struct {
 	*payerstate.Memory
 	events     chan string
 	reserveErr error
+	commitErr  error
 	lastJob    payerstate.Job
+	lastReq    payerstate.Request
 }
 
 func (s *spyState) Reserve(ctx context.Context, r payerstate.Request) (payerstate.ReservationID, error) {
+	s.lastReq = r
 	if s.reserveErr != nil {
 		return "", s.reserveErr
 	}
@@ -56,6 +60,9 @@ func (s *spyState) Release(ctx context.Context, id payerstate.ReservationID) err
 	return err
 }
 func (s *spyState) Commit(ctx context.Context, id payerstate.ReservationID, job payerstate.Job) error {
+	if s.commitErr != nil {
+		return s.commitErr
+	}
 	s.lastJob = job
 	err := s.Memory.Commit(ctx, id, job)
 	s.events <- "commit"
@@ -255,8 +262,11 @@ func TestFreeRoutePassesThrough(t *testing.T) {
 	c, state := setup(t)
 	e := open(t, c)
 	resp := e.request("/healthz")
-	if rh := resp.GetRequestHeaders(); rh == nil || rh.Response != nil {
-		t.Fatalf("free route was touched: %v", resp)
+	// Passed on unchanged, except that a client-made-up payer is dropped.
+	rh := resp.GetRequestHeaders()
+	if rh == nil || rh.Response == nil || len(rh.Response.HeaderMutation.SetHeaders) != 0 ||
+		len(rh.Response.HeaderMutation.RemoveHeaders) != 1 || rh.Response.HeaderMutation.RemoveHeaders[0] != extproc.HeaderPayer {
+		t.Fatalf("free route: %v", resp)
 	}
 	if rh := e.response("200").GetResponseHeaders(); rh == nil || rh.Response != nil {
 		t.Fatal("free route response was touched")
@@ -264,13 +274,37 @@ func TestFreeRoutePassesThrough(t *testing.T) {
 	state.expectNone(t)
 }
 
-func TestPreflightIsNotCharged(t *testing.T) {
+func TestPreflightIsAnsweredNotForwarded(t *testing.T) {
+	c, state := setup(t)
+	e := open(t, c)
+	resp := e.roundTrip(&extprocv3.ProcessingRequest{Request: &extprocv3.ProcessingRequest_RequestHeaders{
+		RequestHeaders: headers(":method", "OPTIONS", ":authority", "api.example.com", ":path", "/search",
+			"origin", "https://app.example", "access-control-request-method", "POST",
+			"access-control-request-headers", "payment-signature, content-type, bad header\r\nx: y")}})
+	im := resp.GetImmediateResponse()
+	if im == nil || im.Status.Code != typev3.StatusCode_NoContent {
+		t.Fatalf("preflight got %v", resp.Response)
+	}
+	got := map[string]string{}
+	for _, h := range im.Headers.SetHeaders {
+		got[h.Header.Key] = string(h.Header.RawValue)
+	}
+	if got["access-control-allow-methods"] != "POST" || got["access-control-allow-headers"] != "payment-signature, content-type" ||
+		!strings.Contains(got["access-control-expose-headers"], "payment-required") {
+		t.Fatalf("preflight headers %v", got)
+	}
+	state.expectNone(t)
+}
+
+// An OPTIONS that is not a CORS preflight is priced like any request: an
+// upstream that ignores the method must not serve it for free.
+func TestPlainOptionsIsPriced(t *testing.T) {
 	c, _ := setup(t)
 	e := open(t, c)
 	resp := e.roundTrip(&extprocv3.ProcessingRequest{Request: &extprocv3.ProcessingRequest_RequestHeaders{
 		RequestHeaders: headers(":method", "OPTIONS", ":authority", "api.example.com", ":path", "/search")}})
-	if resp.GetRequestHeaders() == nil {
-		t.Fatalf("preflight got %T", resp.Response)
+	if im := resp.GetImmediateResponse(); im == nil || im.Status.Code != typev3.StatusCode_PaymentRequired {
+		t.Fatalf("plain OPTIONS got %v", resp.Response)
 	}
 }
 
@@ -438,6 +472,23 @@ func TestStateUnavailableFailsClosed(t *testing.T) {
 	if im == nil || im.Status.Code != 503 {
 		t.Fatalf("want 503, got %v", im)
 	}
+}
+
+// A route at its unsettled cap is busy, not the payer's fault: 503 with
+// Retry-After, not a 402 asking to pay again. The reservation names the
+// route, so the store can count it.
+func TestRouteExposureLimitIs503(t *testing.T) {
+	c, state := setup(t)
+	sig := pay(t, challenge(t, open(t, c).request("/search"), 402))
+	state.reserveErr = &payerstate.DeniedError{Reason: payerstate.ReasonRouteExposureLimit}
+	im := open(t, c).request("/search", "payment-signature", sig).GetImmediateResponse()
+	if im == nil || im.Status.Code != 503 || mutation(im.Headers.SetHeaders)["retry-after"] != "30" {
+		t.Fatalf("want 503 with retry-after, got %v", im)
+	}
+	if state.lastReq.Route == "" {
+		t.Fatal("reservation without its route")
+	}
+	state.expectNone(t)
 }
 
 func TestRouteCanPreferAvailability(t *testing.T) {
@@ -713,5 +764,89 @@ func TestContractWalletPayments(t *testing.T) {
 				t.Fatalf("got %v, want %v", resp, tc.code)
 			}
 		})
+	}
+}
+
+// A response whose payment could not be committed (the authorization
+// expired while the backend worked, or Redis failed) is withheld.
+func TestUncommittedResponseIsWithheld(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		code typev3.StatusCode
+	}{{payerstate.ErrExpired, typev3.StatusCode_PaymentRequired}, {errors.New("redis down"), typev3.StatusCode_ServiceUnavailable}} {
+		c, state := setup(t)
+		pr := challenge(t, open(t, c).request("/search"), 402)
+		e := open(t, c)
+		if rh := e.request("/search", "payment-signature", pay(t, pr)).GetRequestHeaders(); rh == nil {
+			t.Fatal("paid request refused")
+		}
+		state.commitErr = tc.err
+		im := e.response("200").GetImmediateResponse()
+		if im == nil || im.Status.Code != tc.code {
+			t.Fatalf("%v: response not withheld: %v", tc.err, im)
+		}
+	}
+}
+
+func TestUpgradeRefusedOnPricedRoute(t *testing.T) {
+	c, _ := setup(t)
+	e := open(t, c)
+	resp := e.roundTrip(&extprocv3.ProcessingRequest{Request: &extprocv3.ProcessingRequest_RequestHeaders{
+		RequestHeaders: headers(":method", "GET", ":authority", "api.example.com", ":path", "/search", "upgrade", "websocket")}})
+	if im := resp.GetImmediateResponse(); im == nil || im.Status.Code != typev3.StatusCode_BadRequest {
+		t.Fatalf("upgrade got %v", resp.Response)
+	}
+}
+
+// A route that must always be priced but has no prices loaded is refused,
+// not passed on for free.
+func TestUnpricedTenantRouteIsRefused(t *testing.T) {
+	state := &spyState{Memory: payerstate.NewMemory(), events: make(chan string, 10)}
+	c := serveWith(t, state, extproc.Options{RefuseUnpriced: []string{"httproute/t-*/p-*"}})
+	ask := func(route string) *extprocv3.ProcessingResponse {
+		e := open(t, c)
+		attrs, _ := structpb.NewStruct(map[string]any{"xds.route_name": route})
+		return e.roundTrip(&extprocv3.ProcessingRequest{
+			Attributes: map[string]*structpb.Struct{"envoy.filters.http.ext_proc": attrs},
+			Request: &extprocv3.ProcessingRequest_RequestHeaders{
+				RequestHeaders: headers(":method", "GET", ":authority", "acme.apivend.dev", ":path", "/nowhere")}})
+	}
+	if im := ask("httproute/t-acme/p-v1-search-4d58200d/rule/0/match/0/acme_apivend_dev").GetImmediateResponse(); im == nil || im.Status.Code != typev3.StatusCode_ServiceUnavailable {
+		t.Fatal("unpriced tenant route was not refused")
+	}
+	for _, free := range []string{"httproute/api/catalogue/rule/0/match/0/api_apivend_dev", "httproute/t-acme/discovery/rule/0/match/0/acme_apivend_dev", ""} {
+		if ask(free).GetRequestHeaders() == nil {
+			t.Fatalf("free route %q was refused", free)
+		}
+	}
+}
+
+// A route whose PaymentPolicy was rejected is refused (503), whatever the
+// filter's own patterns say: the controller lists it in the table.
+func TestRejectedPolicyRouteIsRefused(t *testing.T) {
+	table, err := pricing.Build(pricing.Config{Refuse: []string{"httproute/shop/search/"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := &spyState{Memory: payerstate.NewMemory(), events: make(chan string, 10)}
+	c := serveTable(t, table, state, extproc.Options{})
+	ask := func(route string) *extprocv3.ProcessingResponse {
+		e := open(t, c)
+		attrs, _ := structpb.NewStruct(map[string]any{"xds.route_name": route})
+		return e.roundTrip(&extprocv3.ProcessingRequest{
+			Attributes: map[string]*structpb.Struct{"envoy.filters.http.ext_proc": attrs},
+			Request: &extprocv3.ProcessingRequest_RequestHeaders{
+				RequestHeaders: headers(":method", "GET", ":authority", "shop.example", ":path", "/search")}})
+	}
+	if im := ask("httproute/shop/search/rule/0/match/0/shop_example").GetImmediateResponse(); im == nil || im.Status.Code != typev3.StatusCode_ServiceUnavailable {
+		t.Fatal("route of a rejected policy was not refused")
+	}
+	for _, free := range []string{"httproute/shop/searching/rule/0/match/0/shop_example", "httproute/shop/other/rule/0/match/0/shop_example"} {
+		if ask(free).GetRequestHeaders() == nil {
+			t.Fatalf("%s was refused", free)
+		}
+	}
+	if _, err := pricing.Build(pricing.Config{Refuse: []string{"httproute/"}}); err == nil {
+		t.Fatal("a refuse prefix without namespace and name was accepted")
 	}
 }

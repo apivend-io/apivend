@@ -33,6 +33,10 @@ type Config struct {
 	// Batch holds the gateway's batch-settlement channel terms; required
 	// when any route accepts scheme batch-settlement.
 	Batch *BatchConfig `json:"batch,omitempty"`
+	// Refuse lists Envoy route name prefixes (httproute/<ns>/<name>/) whose
+	// PaymentPolicy exists but was rejected: the filter answers 503 there,
+	// never serves them free.
+	Refuse []string `json:"refuse,omitempty"`
 }
 
 // BatchConfig: the receiver authorizer is our claim-signing key's address
@@ -81,6 +85,9 @@ type SettlementConfig struct {
 	// MaxUnsettledPerPayer caps, in the price currency, what one payer may
 	// have in flight plus served-but-not-yet-settled. Default 1.00.
 	MaxUnsettledPerPayer string `json:"maxUnsettledPerPayer,omitempty"`
+	// MaxUnsettledPerRoute caps, in the price currency, what the route may
+	// have served-but-not-yet-settled across all payers. Empty: no cap.
+	MaxUnsettledPerRoute string `json:"maxUnsettledPerRoute,omitempty"`
 }
 
 type ProviderRef struct {
@@ -169,6 +176,18 @@ type Discovery struct {
 // Table is an immutable set of priced routes.
 type Table struct {
 	routes []*Route // longest prefix first
+	refuse []string
+}
+
+// Refused reports whether envoyRoute belongs to a route whose policy was
+// rejected (Config.Refuse).
+func (t *Table) Refused(envoyRoute string) bool {
+	for _, p := range t.refuse {
+		if envoyRoute != "" && strings.HasPrefix(envoyRoute, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // Load reads and validates a price table file.
@@ -200,6 +219,12 @@ func Empty() *Table { return &Table{} }
 // Build validates cfg and resolves it into a Table.
 func Build(cfg Config) (*Table, error) {
 	t := &Table{}
+	for i, p := range cfg.Refuse {
+		if parts := strings.Split(p, "/"); len(parts) != 4 || parts[0] != "httproute" || parts[1] == "" || parts[2] == "" || parts[3] != "" {
+			return nil, fmt.Errorf("refuse[%d] %q: an Envoy route name prefix httproute/<namespace>/<name>/", i, p)
+		}
+		t.refuse = append(t.refuse, p)
+	}
 	names := map[string]struct{}{}
 	for i, rc := range cfg.Routes {
 		r, err := buildRoute(rc, cfg.Batch)
@@ -340,6 +365,16 @@ func buildRoute(rc RouteConfig, batch *BatchConfig) (*Route, error) {
 			return nil, fmt.Errorf("settlement.maxUnsettledPerPayer %s is below the price %s: no request could ever be served",
 				maxUnsettled, rc.Price.Amount)
 		}
+		var routeLimit *big.Int
+		if m := rc.Settlement.MaxUnsettledPerRoute; m != "" {
+			if routeLimit, err = toAtomic(m, asset.decimals); err != nil {
+				return nil, fmt.Errorf("settlement.maxUnsettledPerRoute: %w", err)
+			}
+			if routeLimit.Cmp(amount) < 0 {
+				return nil, fmt.Errorf("settlement.maxUnsettledPerRoute %s is below the price %s: no request could ever be served",
+					m, rc.Price.Amount)
+			}
+		}
 		schemes := ac.Schemes
 		if len(schemes) == 0 {
 			schemes = []string{x402.SchemeExact}
@@ -360,7 +395,8 @@ func buildRoute(rc RouteConfig, batch *BatchConfig) (*Route, error) {
 			continue
 		}
 		r.Offers = append(r.Offers, verify.Offer{
-			MaxUnsettled: limit,
+			MaxUnsettled:         limit,
+			MaxUnsettledPerRoute: routeLimit,
 			Wire: x402.Requirements{
 				Scheme:            x402.SchemeExact,
 				Network:           asset.caip2,

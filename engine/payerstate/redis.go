@@ -56,8 +56,8 @@ const (
 )
 
 var reserveScript = redis.NewScript(`
--- KEYS: bal holds amounts held nonces blocked
--- ARGV: now amount expiry maxUnsettled freshness nonce skipBalance
+-- KEYS: bal holds amounts held nonces blocked exposure
+-- ARGV: now amount expiry maxUnsettled freshness nonce skipBalance route maxRoute
 local now = tonumber(ARGV[1])
 if redis.call('EXISTS', KEYS[6]) == 1 then return 'payer_blocked' end
 
@@ -76,6 +76,12 @@ if redis.call('ZSCORE', KEYS[5], ARGV[6]) then return 'payment_already_used' end
 local held = tonumber(redis.call('GET', KEYS[4]) or '0')
 local amount = tonumber(ARGV[2])
 if ARGV[4] ~= '' and held + amount > tonumber(ARGV[4]) then return 'exposure_limit' end
+-- The route's served-but-unsettled amount, across all payers: payer
+-- addresses are free, so the per-payer cap alone does not bound a route.
+if ARGV[9] ~= '' then
+  local exposed = tonumber(redis.call('HGET', KEYS[7], ARGV[8]) or '0')
+  if exposed + amount > tonumber(ARGV[9]) then return 'route_exposure_limit' end
+end
 
 if ARGV[7] ~= '1' then
   local b = redis.call('HMGET', KEYS[1], 'balance', 'at')
@@ -210,6 +216,13 @@ func (r *Redis) ReserveDetailed(ctx context.Context, req Request) (Reservation, 
 		}
 		maxUnsettled = m.String()
 	}
+	maxRoute := ""
+	if m := req.Policy.MaxUnsettledPerRoute; m != nil && req.Route != "" {
+		if m.Cmp(bigMaxExact) > 0 {
+			m = bigMaxExact
+		}
+		maxRoute = m.String()
+	}
 	freshness := req.Policy.Freshness
 	if freshness <= 0 {
 		freshness = DefaultFreshness
@@ -225,9 +238,9 @@ func (r *Redis) ReserveDetailed(ctx context.Context, req Request) (Reservation, 
 			skip = "1"
 		}
 		res, err := reserveScript.Run(ctx, r.rdb,
-			[]string{bal, holds, amounts, held, nonces, blocked},
+			[]string{bal, holds, amounts, held, nonces, blocked, keyExposure},
 			ms(r.now()), req.Amount.String(), ms(req.Expiry), maxUnsettled,
-			freshness.Milliseconds(), req.Nonce, skip).Text()
+			freshness.Milliseconds(), req.Nonce, skip, req.Route, maxRoute).Text()
 		if err != nil {
 			return Reservation{}, fmt.Errorf("%w: store: %v", ErrUnavailable, err)
 		}

@@ -2,6 +2,7 @@ package chain
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"math/big"
@@ -215,3 +216,38 @@ func TestRPCRejectsNoCode(t *testing.T) {
 }
 
 func jsonInt(v int64) string { b, _ := json.Marshal(v); return string(b) }
+
+// TransferAfter reads the token's Transfer log right after the given log
+// index in a transaction's receipt, and nothing else: a Transfer of another
+// token, or a log further away, is not the one.
+func TestTransferAfter(t *testing.T) {
+	word := func(a evm.Address) string { return "0x" + hex.EncodeToString(evm.AddressWord(a)) }
+	to, _ := evm.ParseAddress("0x4C5d78BebbF28853c28eB385b936875e68107C60")
+	other, _ := evm.ParseAddress("0x00000000000000000000000000000000000000ee")
+	transfer := "0x" + hex.EncodeToString(topicTransfer[:])
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqs []struct{ ID int64 }
+		json.NewDecoder(r.Body).Decode(&reqs)
+		logs := []map[string]any{
+			{"address": token.Hex(), "topics": []string{"0x" + hex.EncodeToString(topicAuthUsed[:]), word(owner), "0x" + strings.Repeat("11", 32)}, "data": "0x", "logIndex": "0x4"},
+			{"address": token.Hex(), "topics": []string{transfer, word(owner), word(to)}, "data": "0x" + strings.Repeat("0", 60) + "2710", "logIndex": "0x5"},
+			{"address": other.Hex(), "topics": []string{transfer, word(owner), word(other)}, "data": "0x" + strings.Repeat("0", 63) + "1", "logIndex": "0x6"},
+		}
+		json.NewEncoder(w).Encode([]map[string]any{{"jsonrpc": "2.0", "id": reqs[0].ID, "result": map[string]any{"logs": logs}}})
+	}))
+	defer srv.Close()
+	r, err := NewRPC([]string{srv.URL}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := r.TransferAfter(context.Background(), "0xabc", token, 4)
+	if err != nil || !found || got.From != owner || got.To != to || got.Value.Int64() != 10_000 {
+		t.Fatalf("after log 4: %+v %v %v", got, found, err)
+	}
+	if _, found, _ := r.TransferAfter(context.Background(), "0xabc", token, 5); found {
+		t.Fatal("another token's Transfer accepted")
+	}
+	if _, found, _ := r.TransferAfter(context.Background(), "0xabc", token, 8); found {
+		t.Fatal("found a log that is not there")
+	}
+}

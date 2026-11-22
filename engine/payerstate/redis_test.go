@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -406,6 +407,56 @@ func TestConcurrentReplicasCannotDoubleSpend(t *testing.T) {
 		t.Fatalf("held = %d, want 100000", held)
 	}
 	t.Logf("won=%d insufficient=%d replayed=%d", won.Load(), insufficient.Load(), replayed.Load())
+}
+
+// The per-route cap counts every payer's served-but-unsettled amount on the
+// route: fresh payer addresses do not get around it.
+func TestRouteExposureCap(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.chain.SetBalance(aliceAddr, 1_000_000)
+	other := evm.Address{0xb0, 0xb0}
+	f.chain.SetBalance(other, 1_000_000)
+	on := func(payer, nonce, route string) Request {
+		r := f.req(nonce, 10_000)
+		r.Payer, r.Route = payer, route
+		r.Policy.MaxUnsettledPerRoute = big.NewInt(25_000)
+		return r
+	}
+	serve := func(r Request) ReservationID {
+		t.Helper()
+		id, err := f.state.Reserve(ctx, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		j := job(f)
+		j.Route = r.Route
+		if err := f.state.Commit(ctx, id, j); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	a := serve(on(alice, "0xa", "search"))
+	serve(on(strings.ToLower(other.Hex()), "0xb", "search"))
+	// 20 000 served and unsettled on "search", by two payers: a third
+	// payment of 10 000 would pass 25 000, whoever pays.
+	f.denied(on(strings.ToLower(other.Hex()), "0xc", "search"), ReasonRouteExposureLimit)
+	f.denied(on(alice, "0xd", "search"), ReasonRouteExposureLimit)
+	// Another route has its own budget; a request without a route or a
+	// cap is not limited by it.
+	serve(on(alice, "0xe", "maps"))
+	r := on(alice, "0xf", "search")
+	r.Policy.MaxUnsettledPerRoute = nil
+	if _, err := f.state.Reserve(ctx, r); err != nil {
+		t.Fatalf("no cap: %v", err)
+	}
+	// A refusal holds nothing, and settlement frees room.
+	if err := f.state.Settled(ctx, a, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.state.Reserve(ctx, on(alice, "0xd", "search")); err != nil {
+		t.Fatalf("after settlement: %v", err)
+	}
 }
 
 func TestExposureByRoute(t *testing.T) {

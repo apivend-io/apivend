@@ -203,6 +203,16 @@ type Settlement struct {
 	// +optional
 	// +kubebuilder:validation:Pattern=`^[0-9]*\.?[0-9]+$`
 	MaxUnsettledPerPayer string `json:"maxUnsettledPerPayer,omitempty"`
+
+	// MaxUnsettledPerRoute caps, in the price currency, what this route may
+	// have served-but-unsettled across all payers. Payer addresses are free,
+	// so the per-payer cap alone does not bound the seller's loss in async
+	// mode. A payment past it is refused (503, Retry-After) until
+	// settlements catch up. Default: the controller's
+	// -default-max-unsettled-per-route, or no cap.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^[0-9]*\.?[0-9]+$`
+	MaxUnsettledPerRoute string `json:"maxUnsettledPerRoute,omitempty"`
 }
 
 type ProviderRef struct {

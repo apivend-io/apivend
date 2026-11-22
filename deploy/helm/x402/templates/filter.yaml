@@ -54,7 +54,7 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "x402.labels" . | nindent 8 }}
+        {{- include "x402.podLabels" . | nindent 8 }}
         app.kubernetes.io/component: filter
       {{- if .Values.metrics.annotations }}
       annotations:
@@ -80,6 +80,9 @@ spec:
             - -min-validity-remaining={{ .Values.filter.minValidityRemaining }}
             - -chain-read-timeout={{ .Values.filter.chainReadTimeout }}
             - -credit-confirmations={{ .Values.filter.creditConfirmations }}
+            {{- with .Values.filter.refuseUnpricedRoutes }}
+            - -refuse-unpriced-routes={{ join "," . }}
+            {{- end }}
             {{- if .Values.hostedState.url }}
             - -hosted-state={{ .Values.hostedState.url }}
             {{- end }}
