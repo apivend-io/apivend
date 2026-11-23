@@ -12,6 +12,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -236,10 +237,18 @@ func (s *Server) decide(ctx context.Context, t *txn, h *extprocv3.HttpHeaders, e
 	}
 
 	raw, present := hdr[x402.HeaderPaymentSignature]
+	// A request the upstream cannot answer is refused before its payment is
+	// looked at: nothing reserved, nothing charged. Without a payment it
+	// still gets its 402 (directories probe the bare URL), naming what is
+	// missing.
+	missing := missingQuery(hdr[":path"], route.RequiredQuery)
 	if !present {
-		return s.challenge(route, resource, typev3.StatusCode_PaymentRequired, "PAYMENT-SIGNATURE header is required", "challenge"), metrics.DecisionChallenged
+		reason := "PAYMENT-SIGNATURE header is required"
+		if len(missing) > 0 {
+			reason += "; missing required query parameter: " + strings.Join(missing, ", ") + " (a paid request without it is refused and not charged)"
+		}
+		return s.challenge(route, resource, typev3.StatusCode_PaymentRequired, reason, "challenge"), metrics.DecisionChallenged
 	}
-
 	var payload x402.PaymentPayload
 	if err := x402.DecodeHeader(raw, &payload); err != nil {
 		s.log.Info("payment rejected", "route", route.Name, "reason", x402.ErrInvalidPayload, "detail", err.Error())
@@ -247,8 +256,13 @@ func (s *Server) decide(ctx context.Context, t *txn, h *extprocv3.HttpHeaders, e
 		return s.challenge(route, resource, typev3.StatusCode_BadRequest, x402.ErrInvalidPayload, "malformed"), metrics.DecisionMalformed
 	}
 
+	// A batch refund never calls the upstream, so it needs no parameters:
+	// vouchers are checked for them once the refund flag is known.
 	if payload.Accepted.Scheme == x402.SchemeBatch {
-		return s.decideVoucher(ctx, t, hdr, route, resource, &payload)
+		return s.decideVoucher(ctx, t, hdr, route, resource, &payload, missing)
+	}
+	if len(missing) > 0 {
+		return missingParams(missing), "refused"
 	}
 
 	payment, verr := verify.Verify(ctx, &payload, route.Offers, s.now(), s.opts)
@@ -740,4 +754,34 @@ func hexEncode(b []byte) string {
 		out[2*i], out[2*i+1] = hexDigits[c>>4], hexDigits[c&0x0f]
 	}
 	return string(out)
+}
+
+// missingParams is the 400 for a paid request without a required query
+// parameter: refused before its payment is verified or reserved.
+func missingParams(missing []string) *extprocv3.ProcessingResponse {
+	body, _ := json.Marshal(map[string]string{"error": "missing_parameter",
+		"message": "missing required query parameter: " + strings.Join(missing, ", ") + "; nothing was charged"})
+	return immediate(typev3.StatusCode_BadRequest, nil, body, "x402_missing_parameter")
+}
+
+// missingQuery returns the names in required that path's query string does
+// not carry with a value. A query that cannot be parsed is left to the
+// upstream (nothing is reported missing).
+func missingQuery(path string, required []string) []string {
+	if len(required) == 0 {
+		return nil
+	}
+	_, raw, _ := strings.Cut(path, "?")
+	raw, _, _ = strings.Cut(raw, "#")
+	q, err := url.ParseQuery(raw)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, name := range required {
+		if q.Get(name) == "" {
+			out = append(out, name)
+		}
+	}
+	return out
 }

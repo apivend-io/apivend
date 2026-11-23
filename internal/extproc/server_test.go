@@ -109,9 +109,11 @@ func testTable(t *testing.T) *pricing.Table {
 	listed := route("listed", "/listed")
 	listed.Discovery = &pricing.DiscoveryConfig{Publish: true, ServiceName: "Search", Tags: []string{"search"},
 		Bazaar: json.RawMessage(testBazaar)}
+	needs := route("needs", "/needs")
+	needs.RequiredQuery = []string{"address"}
 	quiet := route("quiet", "/quiet")
 	quiet.Discovery = &pricing.DiscoveryConfig{ServiceName: "Quiet", Bazaar: json.RawMessage(testBazaar)}
-	table, err := pricing.Build(pricing.Config{Routes: []pricing.RouteConfig{route("search", "/search"), lenient, sync, listed, quiet}})
+	table, err := pricing.Build(pricing.Config{Routes: []pricing.RouteConfig{route("search", "/search"), lenient, sync, listed, quiet, needs}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -932,4 +934,30 @@ func TestScrubEdgeCases(t *testing.T) {
 	}
 	e.response("200")
 	state.expect(t, "commit")
+}
+
+// A required query parameter missing: without a payment the 402 still
+// comes (directories probe the bare URL) and names it; with a payment the
+// request is refused 400 before the payment is looked at, nothing reserved.
+func TestMissingRequiredParameter(t *testing.T) {
+	c, state := setup(t)
+	pr := challenge(t, open(t, c).request("/needs"), 402)
+	if !strings.Contains(pr.Error, "missing required query parameter: address") {
+		t.Fatalf("402 error %q", pr.Error)
+	}
+	if pr := challenge(t, open(t, c).request("/needs?address=0xabc"), 402); strings.Contains(pr.Error, "missing") {
+		t.Fatalf("402 with the parameter: %q", pr.Error)
+	}
+	for _, path := range []string{"/needs", "/needs?address=", "/needs?other=1"} {
+		resp := open(t, c).request(path, "payment-signature", pay(t, pr))
+		im := resp.GetImmediateResponse()
+		if im == nil || im.Status.Code != typev3.StatusCode_BadRequest || !strings.Contains(string(im.Body), "nothing was charged") {
+			t.Fatalf("%s paid: %v", path, resp.Response)
+		}
+	}
+	state.expectNone(t)
+	resp := open(t, c).request("/needs?address=0xabc", "payment-signature", pay(t, pr))
+	if resp.GetRequestHeaders() == nil {
+		t.Fatalf("paid with the parameter: %v", resp.Response)
+	}
 }

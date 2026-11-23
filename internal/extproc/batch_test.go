@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"math/big"
 	"strings"
 	"sync/atomic"
@@ -23,12 +24,12 @@ import (
 
 const receiverAuth = "0x01d4000000000000000000000000000000006aE6"
 
-func batchTable(t *testing.T) *pricing.Table {
+func batchTable(t *testing.T, required ...string) *pricing.Table {
 	t.Helper()
 	table, err := pricing.Build(pricing.Config{
 		Batch: &pricing.BatchConfig{ReceiverAuthorizer: receiverAuth, WithdrawDelay: 86400},
 		Routes: []pricing.RouteConfig{{
-			Name: "cheap", Match: pricing.MatchConfig{PathPrefix: "/cheap"},
+			Name: "cheap", Match: pricing.MatchConfig{PathPrefix: "/cheap"}, RequiredQuery: required,
 			Price:   pricing.PriceConfig{Amount: "0.001", Currency: "USD"},
 			Accepts: []pricing.AcceptConfig{{Network: "base-sepolia", Asset: "USDC", PayTo: payTo, Schemes: []string{"exact", "batch-settlement"}}},
 		}},
@@ -348,5 +349,52 @@ func TestBatchRefund(t *testing.T) {
 	job := <-jobs
 	if job.Kind != settle.KindBatchRefund || job.RefundAmount != "97000" {
 		t.Fatalf("refund job %+v", job)
+	}
+}
+
+// A route with a required query parameter: a paying voucher without it is
+// refused 400 before anything is reserved, but a cooperative refund (which
+// never calls the upstream) still goes through on the bare URL (security
+// review of v0.4.0).
+func TestBatchRequiredParameter(t *testing.T) {
+	rdb, _ := redistest.Start(t)
+	state := payerstate.NewRedis(rdb)
+	var refunded atomic.Bool
+	channels := payerstate.NewChannels(rdb, func(context.Context, string, [32]byte) (evm.Channel, error) {
+		if refunded.Load() {
+			return evm.Channel{Balance: big.NewInt(2000), TotalClaimed: big.NewInt(1000), RefundNonce: big.NewInt(1)}, nil
+		}
+		return evm.Channel{Balance: big.NewInt(100000), TotalClaimed: big.NewInt(0), RefundNonce: big.NewInt(0)}, nil
+	})
+	c := serveTable(t, batchTable(t, "q"), state, extproc.Options{Channels: channels})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		for ctx.Err() == nil {
+			cl, err := state.Claim(ctx, time.Second)
+			if err != nil || cl == nil {
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
+			refunded.Store(true)
+			state.Settled(ctx, cl.ID, 1)
+			state.PublishResult(ctx, cl.ID, payerstate.Result{Status: "settled", Transaction: "0xrefund"})
+		}
+	}()
+
+	pr := challenge(t, open(t, c).request("/cheap"), 402)
+	client := newChannelClient(t, pr)
+	resp := open(t, c).request("/cheap", "payment-signature", client.voucher(1000))
+	if im := resp.GetImmediateResponse(); im == nil || im.Status.Code != typev3.StatusCode_BadRequest || !strings.Contains(string(im.Body), "missing_parameter") {
+		t.Fatalf("voucher without the parameter: %v", resp.Response)
+	}
+	e := open(t, c)
+	if resp := e.request("/cheap?q=1", "payment-signature", client.voucher(1000)); resp.GetImmediateResponse() != nil {
+		t.Fatalf("voucher with the parameter: %v", resp.Response)
+	}
+	e.response("200")
+	resp = open(t, c).request("/cheap", "payment-signature", client.refundHeader(1000, ""))
+	if im := resp.GetImmediateResponse(); im == nil || im.Status.Code == typev3.StatusCode_BadRequest {
+		t.Fatalf("refund on the bare URL: %v", resp.Response)
 	}
 }

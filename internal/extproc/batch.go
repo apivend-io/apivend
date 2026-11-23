@@ -38,7 +38,7 @@ var channelReasons = map[string]string{
 // decideVoucher handles a batch-settlement payload: the voucher is checked
 // locally and the channel held for this request; nothing is charged until
 // the backend answers 2xx.
-func (s *Server) decideVoucher(ctx context.Context, t *txn, hdr map[string]string, route *pricing.Route, resource x402.ResourceInfo, payload *x402.PaymentPayload) (*extprocv3.ProcessingResponse, string) {
+func (s *Server) decideVoucher(ctx context.Context, t *txn, hdr map[string]string, route *pricing.Route, resource x402.ResourceInfo, payload *x402.PaymentPayload, missing []string) (*extprocv3.ProcessingResponse, string) {
 	if s.channels == nil {
 		s.m.Rejection(route.Name, x402.ErrInvalidScheme)
 		return s.challenge(route, resource, typev3.StatusCode_PaymentRequired, x402.ErrInvalidScheme, "rejected"), metrics.DecisionRejected
@@ -63,6 +63,11 @@ func (s *Server) decideVoucher(ctx context.Context, t *txn, hdr map[string]strin
 	}
 	if v.Refund {
 		return s.refund(ctx, t, hdr, route, resource, payload, v, vreq)
+	}
+	// A paying voucher calls the upstream: refused without its required
+	// parameters, before anything is reserved (verification changes nothing).
+	if len(missing) > 0 {
+		return missingParams(missing), "refused"
 	}
 	if v.Deposit != nil {
 		if resp, decision := s.deposit(ctx, t, hdr, route, resource, payload, v, vreq); resp != nil {

@@ -2,12 +2,15 @@ package controller
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 
 	x402v1 "apivend.io/apivend/api/v1alpha1"
+	"apivend.io/apivend/internal/pricing"
 )
 
 func nameCheckDiscovery(enabled bool) *x402v1.Discovery {
@@ -44,6 +47,23 @@ func TestBazaarFor(t *testing.T) {
 	}
 	if ext.Info.Output["type"] != "json" || ext.Info.Output["example"].(map[string]any)["complete"] != true {
 		t.Fatalf("output = %v", ext.Info.Output)
+	}
+	// The output schema is inferred from the example.
+	var full struct {
+		Schema struct {
+			Properties struct {
+				Output struct {
+					Properties struct {
+						Example map[string]any `json:"example"`
+					} `json:"properties"`
+				} `json:"output"`
+			} `json:"properties"`
+		} `json:"schema"`
+	}
+	json.Unmarshal(raw, &full)
+	ex := full.Schema.Properties.Output.Properties.Example
+	if ex["type"] != "object" || ex["properties"].(map[string]any)["complete"].(map[string]any)["type"] != "boolean" {
+		t.Fatalf("output schema = %v", ex)
 	}
 	props := ext.Schema["properties"].(map[string]any)["input"].(map[string]any)
 	qp := props["properties"].(map[string]any)["queryParams"].(map[string]any)
@@ -113,5 +133,31 @@ func TestDiscoveryReachesTheFilter(t *testing.T) {
 	json.Unmarshal(want, &exp)
 	if !reflect.DeepEqual(got, exp) {
 		t.Fatalf("bazaar through the price table:\n%s\nwant\n%s", l.Bazaar, want)
+	}
+}
+
+// A large example: its inferred schema would push the extension past the
+// limit, so it is published without one rather than refused (a policy that
+// fitted under v0.3 keeps serving); a larger example than the limit is refused.
+func TestBazaarForLargeExample(t *testing.T) {
+	d := nameCheckDiscovery(true)
+	obj := map[string]int{}
+	for i := 0; i < 700; i++ {
+		obj[fmt.Sprintf("k%03d", i)] = i
+	}
+	ex, _ := json.Marshal(obj)
+	d.Output.Example = &apiextensionsv1.JSON{Raw: ex}
+	raw, err := BazaarFor(d)
+	if err != nil || len(raw) > pricing.MaxBazaarBytes {
+		t.Fatalf("large example: %d bytes, %v", len(raw), err)
+	}
+	if !strings.Contains(string(raw), `"example":{}`) {
+		t.Fatal("schema kept although too large")
+	}
+	big := make([]int, 9000)
+	ex, _ = json.Marshal(big)
+	d.Output.Example = &apiextensionsv1.JSON{Raw: ex}
+	if _, err := BazaarFor(d); err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Fatalf("oversized example: %v", err)
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -59,6 +60,11 @@ type RouteConfig struct {
 	Risk              RiskConfig       `json:"risk,omitempty"`
 	// Discovery describes the route for x402 catalogues.
 	Discovery *DiscoveryConfig `json:"discovery,omitempty"`
+	// RequiredQuery names query parameters every request must carry. A
+	// paid request without one is answered 400 before its payment is
+	// checked; an unpaid one still gets its 402 (directories probe the bare
+	// URL), with the missing names in its error.
+	RequiredQuery []string `json:"requiredQuery,omitempty"`
 }
 
 // DiscoveryConfig describes a route for x402 catalogues: resource metadata
@@ -156,6 +162,8 @@ type Route struct {
 	// Sync holds the response until settlement, for at most SyncTimeout.
 	Sync        bool
 	SyncTimeout time.Duration
+	// RequiredQuery names the query parameters a request must carry.
+	RequiredQuery []string
 
 	hosts       map[string]struct{}
 	prefix      string
@@ -172,6 +180,12 @@ type Discovery struct {
 	// Bazaar is the extension value, compact JSON.
 	Bazaar json.RawMessage
 }
+
+// paramName is what a required query parameter may be called.
+var paramName = regexp.MustCompile(`^[A-Za-z0-9_.\-]{1,64}$`)
+
+// RequirableParam reports whether name can be a required query parameter.
+func RequirableParam(name string) bool { return paramName.MatchString(name) }
 
 // Table is an immutable set of priced routes.
 type Table struct {
@@ -271,16 +285,25 @@ func buildRoute(rc RouteConfig, batch *BatchConfig) (*Route, error) {
 	if timeout < 0 {
 		return nil, errors.New("maxTimeoutSeconds must be positive")
 	}
+	if len(rc.RequiredQuery) > maxRequiredQuery {
+		return nil, fmt.Errorf("at most %d required query parameters", maxRequiredQuery)
+	}
+	for _, q := range rc.RequiredQuery {
+		if !paramName.MatchString(q) {
+			return nil, fmt.Errorf("required query parameter %q: letters, digits, '-', '_' and '.', at most 64", q)
+		}
+	}
 
 	r := &Route{
-		Name:        rc.Name,
-		Description: rc.Description,
-		MimeType:    rc.MimeType,
-		Freshness:   payerstate.DefaultFreshness,
-		Provider:    defaultProvider,
-		prefix:      strings.TrimRight(rc.Match.PathPrefix, "/"),
-		hasPrefix:   rc.Match.PathPrefix != "",
-		routePrefix: rc.Match.EnvoyRoutePrefix,
+		Name:          rc.Name,
+		Description:   rc.Description,
+		MimeType:      rc.MimeType,
+		RequiredQuery: rc.RequiredQuery,
+		Freshness:     payerstate.DefaultFreshness,
+		Provider:      defaultProvider,
+		prefix:        strings.TrimRight(rc.Match.PathPrefix, "/"),
+		hasPrefix:     rc.Match.PathPrefix != "",
+		routePrefix:   rc.Match.EnvoyRoutePrefix,
 	}
 	switch rc.Settlement.Mode {
 	case "", "async":
@@ -544,6 +567,9 @@ const (
 	maxServiceName          = 32
 	maxTags                 = 5
 	maxBazaarBytes          = 16 << 10
+	// MaxBazaarBytes is the most a route's bazaar extension may hold.
+	MaxBazaarBytes   = maxBazaarBytes
+	maxRequiredQuery = 16
 )
 
 func buildDiscovery(description string, dc *DiscoveryConfig) (*Discovery, error) {

@@ -399,6 +399,13 @@ func RouteConfigFor(p *x402v1.PaymentPolicy) pricing.RouteConfig {
 	if d := p.Spec.Discovery; d != nil {
 		bazaar, _ := BazaarFor(d) // reconcile has rejected the policy if this fails
 		rc.Discovery = &pricing.DiscoveryConfig{Publish: d.Enabled, ServiceName: d.ServiceName, Tags: d.Tags, IconURL: d.IconURL, Bazaar: bazaar}
+		for _, q := range d.QueryParams {
+			// Names the gateway cannot check are left to the upstream, so
+			// a policy that was valid before stays valid.
+			if q.Required && pricing.RequirableParam(q.Name) && len(rc.RequiredQuery) < 16 {
+				rc.RequiredQuery = append(rc.RequiredQuery, q.Name)
+			}
+		}
 	}
 	return rc
 }
@@ -475,16 +482,27 @@ func BazaarFor(d *x402v1.Discovery) (json.RawMessage, error) {
 			typ = "json"
 		}
 		output := map[string]any{"type": typ}
+		exampleSchema := map[string]any{}
 		if o.Example != nil && len(o.Example.Raw) > 0 {
-			if !json.Valid(o.Example.Raw) {
+			if len(o.Example.Raw) > pricing.MaxBazaarBytes {
+				return nil, fmt.Errorf("output.example is larger than %d bytes", pricing.MaxBazaarBytes)
+			}
+			var v any
+			if err := json.Unmarshal(o.Example.Raw, &v); err != nil {
 				return nil, errors.New("output.example is not valid JSON")
 			}
 			output["example"] = json.RawMessage(o.Example.Raw)
+			// Directories rank a described output higher (CDP counts the
+			// output schema towards a listing's quality): the schema is
+			// inferred from the example, so every listed route has one.
+			if typ == "json" {
+				exampleSchema = pricing.SchemaOf(v)
+			}
 		}
 		info["output"] = output
-		schemaProps["output"] = map[string]any{"type": "object", "properties": map[string]any{"type": map[string]any{"type": "string"}, "example": map[string]any{}}, "required": []string{"type"}}
+		schemaProps["output"] = map[string]any{"type": "object", "properties": map[string]any{"type": map[string]any{"type": "string"}, "example": exampleSchema}, "required": []string{"type"}}
 	}
-	return json.Marshal(map[string]any{
+	ext := map[string]any{
 		"info": info,
 		"schema": map[string]any{
 			"$schema":    "https://json-schema.org/draft/2020-12/schema",
@@ -492,7 +510,16 @@ func BazaarFor(d *x402v1.Discovery) (json.RawMessage, error) {
 			"properties": schemaProps,
 			"required":   []string{"input"},
 		},
-	})
+	}
+	b, err := json.Marshal(ext)
+	if err != nil || len(b) <= pricing.MaxBazaarBytes || d.Output == nil {
+		return b, err
+	}
+	// The inferred schema is several times the example's size: rather than
+	// push the extension over the limit (and the route out of service, as a
+	// v0.3 policy with a large example would be), publish it without one.
+	schemaProps["output"].(map[string]any)["properties"].(map[string]any)["example"] = map[string]any{}
+	return json.Marshal(ext)
 }
 
 func extensionPolicyName(p *x402v1.PaymentPolicy) string { return "x402-" + p.Name }

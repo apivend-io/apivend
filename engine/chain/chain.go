@@ -65,6 +65,15 @@ func NewRPC(endpoints []string, perCall time.Duration) (*RPC, error) {
 	}, nil
 }
 
+// UseClient sends every call through c instead of the default transport:
+// for a caller whose network policy allows only guarded connections (public
+// addresses, public resolvers). c's timeout bounds each attempt, KeepWarm's
+// pings included, so give it one. Call it before the RPC is used (before
+// KeepWarm and the first Call): it is not safe alongside them.
+func (r *RPC) UseClient(c *http.Client) {
+	r.client, r.warm = c, c
+}
+
 // KeepWarm calls eth_blockNumber on every endpoint now and then every
 // interval until ctx ends, so a connection to each stays open. Without it the
 // first read after an idle spell pays DNS, TCP and TLS setup inside the

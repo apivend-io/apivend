@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.4.0
+
+### Changed
+
+- **Required query parameters are checked before payment.** A route whose
+  policy marks a query parameter `required` (in `discovery.queryParams`)
+  now refuses a paid request without it: 400, before the payment is
+  looked at, so nothing is reserved or charged. An unpaid request still
+  gets its 402, since directories find routes by calling the bare URL;
+  the 402's `error` names the missing parameter. A batch-settlement
+  refund, which never calls the API, needs no parameters.
+- **The bazaar extension describes the output.** A route with
+  `discovery.output.example` now publishes a JSON Schema inferred from it
+  (types, properties, array items) instead of an empty one: directories
+  such as Coinbase's Bazaar count the output schema towards a listing's
+  quality. When the schema would take the extension past its 16 KB limit,
+  the route is published without it rather than refused; an example over
+  16 KB is refused.
+
+### Added
+
+- **`chain.RPC.UseClient`** sends a client's JSON-RPC calls through an
+  HTTP client of the caller's choosing, for callers whose network policy
+  allows only guarded connections.
+
 ## v0.3.0
 
 ### Fixed

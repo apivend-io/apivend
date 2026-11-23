@@ -129,6 +129,11 @@ type Param struct {
 	// +optional
 	// +kubebuilder:validation:MaxLength=200
 	Description string `json:"description,omitempty"`
+	// Required query parameters are checked by the gateway: a paid request
+	// without one is refused with 400 before its payment is looked at
+	// (nothing charged), and the 402 for an unpaid one names it. Names of
+	// letters, digits, '-', '_' and '.' only; others are left to the
+	// upstream.
 	// +optional
 	Required bool `json:"required,omitempty"`
 	// Example is shown to clients as the value to send.

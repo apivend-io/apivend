@@ -163,6 +163,12 @@ spec:
                           minLength: 1
                           type: string
                         required:
+                          description: |-
+                            Required query parameters are checked by the gateway: a paid request
+                            without one is refused with 400 before its payment is looked at
+                            (nothing charged), and the 402 for an unpaid one names it. Names of
+                            letters, digits, '-', '_' and '.' only; others are left to the
+                            upstream.
                           type: boolean
                       required:
                       - name
