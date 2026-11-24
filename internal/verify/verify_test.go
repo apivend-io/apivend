@@ -139,6 +139,11 @@ func TestVerifyRejects(t *testing.T) {
 		{"paid to someone else", func() *x402.PaymentPayload {
 			return signed(t, payerKey, func(a *evm.Authorization) { a.To = stranger.Addr })
 		}, x402.ErrRecipientMismatch, false},
+		{"paid by the seller to itself", func() *x402.PaymentPayload {
+			p := signed(t, payerKey, nil)
+			editPayload(t, p, func(ex *x402.ExactEVMPayload) { ex.Authorization.From = payTo })
+			return p
+		}, x402.ErrSelfSend, false},
 		{"not yet valid", func() *x402.PaymentPayload {
 			return signed(t, payerKey, func(a *evm.Authorization) { a.ValidAfter = big.NewInt(now.Unix() + 5) })
 		}, x402.ErrValidAfter, false},

@@ -127,6 +127,16 @@ func TestDemoAPIs(t *testing.T) {
 	if !strings.Contains(page, ">search</h3>") || !strings.Contains(page, `href="`+priced.URL+`"`) || strings.Contains(page, "Loading the menu") {
 		t.Fatalf("server-rendered menu missing:\n%s", page[:min(len(page), 400)])
 	}
+	// The payment record is in the HTML too: the settled receipt with its
+	// transaction (not the one without, nor the seller's), the totals and
+	// the counters.
+	if !strings.Contains(page, `<span class="what">search</span><span class="amt">$0.001</span>`) ||
+		!strings.Contains(page, `href="https://sepolia.basescan.org/tx/0xabc"`) || strings.Contains(page, "0xdef") ||
+		!strings.Contains(page, `<dt>1 payment in the sandbox</dt><dd>$0.001 test</dd>`) ||
+		!strings.Contains(page, `<span>Paid requests answered</span><b>3</b>`) || !strings.Contains(page, `<span>Payers other than us</span><b>1</b>`) ||
+		strings.Contains(page, `id="totals" hidden`) || !strings.Contains(page, `href="https://docs.apivend.dev"`) {
+		t.Fatalf("server-rendered payment record missing:\n%s", page)
+	}
 	// Without JavaScript the commands and snippets name a real route, and
 	// the page points agents at llms.txt.
 	if strings.Contains(page, "{URL}") || strings.Contains(page, "curl -i …") || !strings.Contains(page, `curl -i &#34;`+priced.URL+`&#34;`) || !strings.Contains(page, `href="/llms.txt"`) {

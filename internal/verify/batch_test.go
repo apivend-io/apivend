@@ -115,6 +115,7 @@ func TestVerifyVoucher(t *testing.T) {
 		want string
 	}{
 		"receiver":     {voucherPayload(t, o, payerKey, 3000, other), x402.ErrBatchReceiverMismatch},
+		"self send":    {voucherPayload(t, o, payerKey, 3000, func(c *x402.BatchChannelConfig) { c.Payer = payTo }), x402.ErrSelfSend},
 		"authorizer":   {voucherPayload(t, o, payerKey, 3000, func(c *x402.BatchChannelConfig) { c.ReceiverAuthorizer = payTo }), x402.ErrBatchAuthorizerMismatch},
 		"token":        {voucherPayload(t, o, payerKey, 3000, func(c *x402.BatchChannelConfig) { c.Token = payTo }), x402.ErrBatchTokenMismatch},
 		"delay":        {voucherPayload(t, o, payerKey, 3000, func(c *x402.BatchChannelConfig) { c.WithdrawDelay = 900 }), x402.ErrBatchWithdrawDelay},

@@ -167,6 +167,9 @@ func Verify(ctx context.Context, p *x402.PaymentPayload, offers []Offer, now tim
 	if auth.To != offer.PayTo {
 		return nil, refused(x402.ErrRecipientMismatch, "authorization.to is not the route's payTo")
 	}
+	if auth.From == offer.PayTo {
+		return nil, refused(x402.ErrSelfSend, "the payer is the route's payTo: a payment to yourself cannot settle; pay from another wallet")
+	}
 	if auth.Value.Cmp(offer.Amount) != 0 {
 		return nil, refused(x402.ErrValueMismatch, "authorization.value is not the route's amount")
 	}

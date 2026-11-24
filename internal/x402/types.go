@@ -31,12 +31,16 @@ const (
 
 // Error codes from section 9 of the specification.
 const (
-	ErrInsufficientFunds   = "insufficient_funds"
-	ErrValidAfter          = "invalid_exact_evm_payload_authorization_valid_after"
-	ErrValidBefore         = "invalid_exact_evm_payload_authorization_valid_before"
-	ErrValueMismatch       = "invalid_exact_evm_payload_authorization_value_mismatch"
-	ErrSignature           = "invalid_exact_evm_payload_signature"
-	ErrRecipientMismatch   = "invalid_exact_evm_payload_recipient_mismatch"
+	ErrInsufficientFunds = "insufficient_funds"
+	ErrValidAfter        = "invalid_exact_evm_payload_authorization_valid_after"
+	ErrValidBefore       = "invalid_exact_evm_payload_authorization_valid_before"
+	ErrValueMismatch     = "invalid_exact_evm_payload_authorization_value_mismatch"
+	ErrSignature         = "invalid_exact_evm_payload_signature"
+	ErrRecipientMismatch = "invalid_exact_evm_payload_recipient_mismatch"
+	// ErrSelfSend: the payer is the route's payTo. Facilitators refuse to
+	// settle a transfer to oneself (self_send_not_allowed), so the gateway
+	// refuses it up front instead of serving and then failing to settle.
+	ErrSelfSend            = "self_send_not_allowed"
 	ErrInvalidNetwork      = "invalid_network"
 	ErrInvalidPayload      = "invalid_payload"
 	ErrInvalidRequirements = "invalid_payment_requirements"

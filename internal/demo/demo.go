@@ -540,8 +540,9 @@ var networkNames = map[string]string{"eip155:8453": "Base", "eip155:84532": "Bas
 // one.
 func (s *Server) page(ctx context.Context) []byte {
 	rs := s.cachedRoutes(ctx)
+	out := s.withRecord(ctx, pageHTML, rs)
 	if len(rs) == 0 {
-		return pageHTML
+		return out
 	}
 	var b strings.Builder
 	for _, r := range rs {
@@ -554,7 +555,7 @@ func (s *Server) page(ctx context.Context) []byte {
 		}
 		b.WriteString(`<p><a href="` + html.EscapeString(r.URL) + `">` + html.EscapeString(r.URL) + `</a></p></li>`)
 	}
-	out := bytes.Replace(pageHTML, []byte(`<li class="item"><p>Loading the menu…</p></li>`), []byte(b.String()), 1)
+	out = bytes.Replace(out, []byte(`<li class="item"><p>Loading the menu…</p></li>`), []byte(b.String()), 1)
 	// The commands in "How to pay" name the sandbox route (else the first
 	// priced one), as the script would.
 	if u := sampleURL(rs); u != "" {
@@ -563,6 +564,140 @@ func (s *Server) page(ctx context.Context) []byte {
 		out = bytes.ReplaceAll(out, []byte("{URL}"), e)
 	}
 	return out
+}
+
+// tapeLength is how many receipts the page's tape shows (the script's TAPE).
+const tapeLength = 8
+
+// pageNetworks names networks as the page's script does.
+var pageNetworks = map[string]string{"eip155:8453": "Base", "eip155:84532": "Base Sepolia"}
+
+func pageNetwork(n string) string {
+	if v := pageNetworks[n]; v != "" {
+		return v
+	}
+	return n
+}
+
+// shortHex is the script's short(): 0x1234…abcd.
+func shortHex(s string) string {
+	if len(s) > 14 {
+		return s[:6] + "…" + s[len(s)-4:]
+	}
+	return s
+}
+
+// cachedValue is f's answer, shared for cacheOK with the JSON endpoint of
+// the same key, decoded into out; false when it cannot be had.
+func (s *Server) cachedValue(ctx context.Context, key string, f func(context.Context) (any, error), out any) bool {
+	s.mu.Lock()
+	e, ok := s.cached[key]
+	s.mu.Unlock()
+	if ok && time.Since(e.at) <= s.cacheOK && json.Unmarshal(e.body, out) == nil {
+		return true
+	}
+	v, err := f(ctx)
+	if err != nil {
+		return false
+	}
+	body, err := json.Marshal(v)
+	if err != nil || json.Unmarshal(body, out) != nil {
+		return false
+	}
+	s.mu.Lock()
+	s.cached[key] = cacheEntry{at: time.Now(), body: body}
+	s.mu.Unlock()
+	return true
+}
+
+// withRecord puts the payment record into the page for readers without
+// JavaScript (agents fetching the page as text): the newest receipts on the
+// tape, the totals under it and the counters. The script replaces each with
+// the live one. Anything that cannot be read is left as the empty markup.
+func (s *Server) withRecord(ctx context.Context, page []byte, rs []RouteTerms) []byte {
+	if s.DB == nil {
+		return page
+	}
+	esc := html.EscapeString
+	names := map[string]string{}
+	for _, r := range rs {
+		if r.Key != "" {
+			names[r.Key] = r.Name
+		}
+	}
+	var feed []Payment
+	if s.cachedValue(ctx, "feed", s.feed, &feed) {
+		var b strings.Builder
+		if len(feed) == 0 {
+			b.WriteString(`<li><p class="empty">No receipts yet. Pay for a request and yours prints here.</p></li>`)
+		}
+		for _, p := range feed[:min(len(feed), tapeLength)] {
+			name := names[p.Route]
+			if name == "" {
+				name = p.Route
+			}
+			tx := `<span>` + esc(shortHex(p.TxHash)) + `</span>`
+			if p.TxURL != "" {
+				tx = `<a href="` + esc(p.TxURL) + `" rel="noopener" title="Transaction ` + esc(p.TxHash) + `">` + esc(shortHex(p.TxHash)) + `</a>`
+			}
+			b.WriteString(`<li class="receipt"><span class="what">` + esc(name) + `</span><span class="amt">` + esc(usd(p.Amount)) + `</span>` +
+				`<span class="meta"><span title="` + esc(p.At.UTC().Format(time.RFC3339)) + `">` + esc(p.At.UTC().Format("2 Jan 15:04 UTC")) + `</span>` +
+				`<span>` + esc(pageNetwork(p.Network)) + `</span><span title="` + esc(p.Payer) + `">from ` + esc(shortHex(p.Payer)) + `</span>` + tx + `</span></li>`)
+		}
+		page = bytes.Replace(page, []byte(`<ul class="receipts" id="receipts" aria-live="polite"></ul>`),
+			[]byte(`<ul class="receipts" id="receipts" aria-live="polite">`+b.String()+`</ul>`), 1)
+	}
+	var totals []Totals
+	if s.cachedValue(ctx, "totals", s.totals, &totals) && len(totals) > 0 {
+		var b strings.Builder
+		for _, t := range totals {
+			test := t.Network == "eip155:84532"
+			what := " payments"
+			if t.Count == 1 {
+				what = " payment"
+			}
+			where, amt := " on "+pageNetwork(t.Network), usd(t.Amount)
+			if test {
+				where, amt = " in the sandbox", amt+" test"
+			}
+			b.WriteString(`<dt>` + esc(groupThousands(t.Count)+what+where) + `</dt><dd>` + esc(amt) + `</dd>`)
+		}
+		page = bytes.Replace(page, []byte(`<div class="totals" id="totals" hidden><p>All payments so far</p><dl id="totalsList"></dl></div>`),
+			[]byte(`<div class="totals" id="totals"><p>All payments so far</p><dl id="totalsList">`+b.String()+`</dl></div>`), 1)
+	}
+	var st Stats
+	if s.cachedValue(ctx, "stats", s.stats, &st) {
+		secs := "n/a"
+		if st.Settled > 0 {
+			if st.SettleSeconds < 10 {
+				secs = fmt.Sprintf("%.1f s", st.SettleSeconds)
+			} else {
+				secs = fmt.Sprintf("%.0f s", st.SettleSeconds)
+			}
+		}
+		row := func(v, label, cls string) string {
+			return `<li class="` + cls + `"><span>` + esc(label) + `</span><b>` + esc(v) + `</b></li>`
+		}
+		flow := row(groupThousands(st.Answered), "Paid requests answered", "") +
+			row(groupThousands(st.Settled), "Settled on chain", "settled") +
+			row(groupThousands(st.Unpaid), "Could not be settled", "") +
+			row(secs, "Answer to settlement, median", "") +
+			row(groupThousands(st.OtherPayers), "Payers other than us", "")
+		page = bytes.Replace(page, []byte(`<ul class="flow" id="flow"></ul>`), []byte(`<ul class="flow" id="flow">`+flow+`</ul>`), 1)
+	}
+	return page
+}
+
+// groupThousands writes n as 1,234.
+func groupThousands(n int64) string {
+	s := fmt.Sprint(n)
+	if n < 0 {
+		return s
+	}
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	return s
 }
 
 // sampleURL is the route the page's commands use: a testnet one first.

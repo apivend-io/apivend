@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.5.0
+
+### Changed
+
+- **A payment to oneself is refused up front.** When the payer is the
+  route's `payTo` (an exact authorization from that address, or a
+  batch-settlement channel paid by it), the gateway answers 402 with
+  `error: self_send_not_allowed` before anything is reserved or the API
+  is called. Facilitators refuse to settle such a transfer, so before
+  this the API answered and the payment was then recorded as unpaid.
+- **The demo page shows its payment record without JavaScript.** The
+  newest receipts, the totals per network and the counters are rendered
+  into the HTML, so agents and other readers that fetch the page as text
+  see them; the script replaces them with the live ones as before.
+
 ## v0.4.0
 
 ### Changed

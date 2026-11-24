@@ -114,6 +114,8 @@ func VerifyBatch(ctx context.Context, p *x402.PaymentPayload, offers []Offer, no
 		return nil, refused(x402.ErrBatchTokenMismatch, "channel token is not the route's asset")
 	case cfg.Receiver != offer.PayTo:
 		return nil, refused(x402.ErrBatchReceiverMismatch, "channel receiver is not the route's payTo")
+	case cfg.Payer == offer.PayTo:
+		return nil, refused(x402.ErrSelfSend, "the channel's payer is the route's payTo: a payment to yourself cannot settle; pay from another wallet")
 	case cfg.ReceiverAuthorizer != terms.ReceiverAuthorizer:
 		return nil, refused(x402.ErrBatchAuthorizerMismatch, "channel receiver authorizer is not ours")
 	case cfg.WithdrawDelay != terms.WithdrawDelay:
