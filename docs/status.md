@@ -4,7 +4,7 @@ What has been tested, and against what. "Real" means the actual software ran
 in the test: a real Envoy, a real Redis, a real chain. A gap is listed as a
 gap.
 
-v0.3 has served and settled real payments on Base Sepolia and Base mainnet,
+v0.6 has served and settled real payments on Base Sepolia and Base mainnet,
 behind Envoy Gateway on Kubernetes. It has not run at volume.
 
 | Part | Tested against | Not yet tested |
@@ -18,6 +18,7 @@ behind Envoy Gateway on Kubernetes. It has not run at volume.
 | Settlement | The x402.org, CDP and PayAI facilitators on Base Sepolia; CDP on Base mainnet. An unreachable facilitator skipped after two failures and payments settled through the next one. Direct settlement with our own gas key on Base Sepolia (about 86,000 gas each) | Volume |
 | Batch settlement | Live on Base Sepolia with the x402 Foundation's Go client: a deposit, requests paid by voucher, a claim paid out to the payee, partial and full refunds. See [BATCH-SETTLEMENT.md](BATCH-SETTLEMENT.md) | Base mainnet; many channels in one claim |
 | Controller | A real API server (k3s v1.37): policies reach `Programmed`, Envoy Gateway accepts what it generates, deleting a policy frees its route within a second, both filter replicas pick up a price change within a millisecond of each other | |
+| Answer check (buyer protection) | A real Envoy 1.34 in `make e2e` in enforce mode: an error-only and an empty 200 get 503, are not charged and are not passed on. Envoy Gateway v1.10 on k3s in enforce mode, by an outside tester with an upstream returning every kind of answer: unusable ones refused and not charged (gzip, br, zstd and identity; paid HEAD; repeated parameters; replay of a refused payment), usable ones and empty results charged, about 1 ms added. Real payments on Base mainnet with the check running (watch mode) | Volume; the missing-fields rule on real traffic |
 | Receipts | Real PostgreSQL 16, with rows for real payments | Reconciliation against the chain (not built) |
 | Helm chart | `helm lint` on every pull request; installs and upgrades on k3s; the kind smoke test installs it on every pull request that changes the gateway | PostgreSQL and hosted-source values on a fresh install |
 | Alerts, dashboard | The files parse | `promtool check rules`; a Grafana import |

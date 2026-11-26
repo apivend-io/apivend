@@ -40,7 +40,7 @@ kubectl -n x402-system create secret generic x402-rpc \
 ### 2. The chart
 
 ```sh
-helm install x402 oci://ghcr.io/apivend-io/charts/x402 --version 0.3.0 \
+helm install x402 oci://ghcr.io/apivend-io/charts/x402 --version 0.6.0 \
   -n x402-system \
   --set redis.url=redis://redis.x402-system.svc:6379/0 \
   --set 'rpc[0].network=base-sepolia' \

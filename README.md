@@ -20,6 +20,10 @@ caller signs a USDC authorization and sends the request again; the gateway
 verifies it, passes the request to your API and charges only if the API
 answered with a 2xx. Payments go from the caller's wallet straight to yours.
 
+Prefer not to run it yourself? [apivend.io](https://apivend.io) hosts it: put
+a price on your API in a few minutes, and your coding agent can set it up for
+you.
+
 ## What it does
 
 - **Verifies payments locally.** Signatures are checked in the gateway, and
@@ -57,7 +61,7 @@ claimed in batches). See [docs/BATCH-SETTLEMENT.md](docs/BATCH-SETTLEMENT.md).
 
 ## Status
 
-**v0.3: early.** The gateway has served and settled real payments on Base
+**v0.6: early.** The gateway has served and settled real payments on Base
 Sepolia and on Base mainnet, behind Envoy Gateway on Kubernetes. It has not
 run at volume yet. What has been tested, and against what, is in
 [docs/status.md](docs/status.md).
@@ -72,7 +76,7 @@ On Kubernetes with Envoy Gateway, the Helm chart installs the filter, the
 settler and the controller:
 
 ```sh
-helm install x402 oci://ghcr.io/apivend-io/charts/x402 --version 0.3.0 \
+helm install x402 oci://ghcr.io/apivend-io/charts/x402 --version 0.6.0 \
   -n x402-system --create-namespace \
   --set redis.url=redis://redis.x402-system.svc:6379/0
 ```
