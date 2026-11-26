@@ -207,6 +207,10 @@ func TestPolicyIsProgrammed(t *testing.T) {
 	backend := ep["backendRefs"].([]any)[0].(map[string]any)
 	attrs, _, _ := unstructured.NestedSlice(ep, "processingMode", "request", "attributes")
 	_, hasResponse, _ := unstructured.NestedMap(ep, "processingMode", "response")
+	// The filter asks for a paid answer's body when it checks answers.
+	if override, _, _ := unstructured.NestedBool(ep, "processingMode", "allowModeOverride"); !override {
+		t.Fatalf("allowModeOverride not set: %v", ep["processingMode"])
+	}
 	if target[0].(map[string]any)["name"] != "search" || backend["name"] != "x402-filter" || backend["namespace"] != systemNS ||
 		backend["port"] != int64(9002) || ep["failOpen"] != false || len(attrs) != 1 || attrs[0] != "xds.route_name" || !hasResponse {
 		t.Fatalf("EnvoyExtensionPolicy spec = %v", eep.Object["spec"])

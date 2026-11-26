@@ -46,6 +46,8 @@ type Filter struct {
 	duration   *prometheus.HistogramVec
 	chainReads *prometheus.HistogramVec
 	syncWait   *prometheus.HistogramVec
+	answers    *prometheus.CounterVec
+	answerHold *prometheus.HistogramVec
 }
 
 func NewFilter() *Filter {
@@ -75,7 +77,16 @@ func NewFilter() *Filter {
 		Help:    "How long sync routes held the response for settlement, by result (settled, unpaid, timeout).",
 		Buckets: []float64{.1, .25, .5, 1, 2, 5, 10, 20},
 	}, []string{"result"})
-	f.Registry.MustRegister(f.requests, f.rejections, f.duration, f.chainReads, f.syncWait)
+	f.answers = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "x402_answer_checks_total",
+		Help: "Paid 2xx answers by answer-check verdict: ok, a refusal (empty, not_json, html, error_only, missing_fields; charged anyway in watch mode), or why it was not checked.",
+	}, []string{"route", "verdict"})
+	f.answerHold = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "x402_answer_hold_seconds",
+		Help:    "What the answer check adds to a checked answer's first byte: body_wait (from the answer's headers until its body had reached the gateway) and check (the check itself).",
+		Buckets: []float64{.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5},
+	}, []string{"part"})
+	f.Registry.MustRegister(f.requests, f.rejections, f.duration, f.chainReads, f.syncWait, f.answers, f.answerHold)
 	return f
 }
 
@@ -104,6 +115,22 @@ func (f *Filter) RequestDuration(decision string, d time.Duration) {
 func (f *Filter) SyncWait(result string, d time.Duration) {
 	if f != nil {
 		f.syncWait.WithLabelValues(result).Observe(d.Seconds())
+	}
+}
+
+// AnswerCheck counts a paid answer's check verdict.
+func (f *Filter) AnswerCheck(route, verdict string) {
+	if f != nil {
+		f.answers.WithLabelValues(route, verdict).Inc()
+	}
+}
+
+// AnswerHold observes how long a checked answer was held: waiting for its
+// body, and checking it.
+func (f *Filter) AnswerHold(bodyWait, check time.Duration) {
+	if f != nil {
+		f.answerHold.WithLabelValues("body_wait").Observe(bodyWait.Seconds())
+		f.answerHold.WithLabelValues("check").Observe(check.Seconds())
 	}
 }
 

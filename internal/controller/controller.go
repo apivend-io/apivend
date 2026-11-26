@@ -543,6 +543,9 @@ func (r *Reconciler) applyExtensionPolicy(ctx context.Context, p *x402v1.Payment
 			"request": map[string]any{"attributes": []any{"xds.route_name"}},
 			// Response headers: charge only on 2xx.
 			"response": map[string]any{},
+			// The filter asks for a paid answer's body when it checks the
+			// answer before charging (-answer-check).
+			"allowModeOverride": true,
 		},
 	}
 	// Always set: Envoy's 200ms default is shorter than a cold chain read

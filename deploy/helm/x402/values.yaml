@@ -61,6 +61,11 @@ filter:
   # attached to the listener those routes use, a route whose PaymentPolicy
   # is missing or rejected is refused instead of served free.
   refuseUnpricedRoutes: []
+  # What the filter does with a paid 2xx answer before charging for it:
+  # "off" (charge on the headers), "watch" (check it, count the verdict,
+  # charge anyway) or "enforce" (an obviously unusable answer, such as an
+  # empty body or an error dressed as a 200, is not charged). Keep it quoted.
+  answerCheck: "off"
   resources: {}
 
 settler:

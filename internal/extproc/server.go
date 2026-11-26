@@ -2,7 +2,9 @@
 // payment on priced routes.
 //
 // Envoy must send request headers and response headers (bodies and trailers
-// are not needed) and must fail closed when the processor is unavailable.
+// are not needed; with the answer check on, the filter asks for a paid
+// answer's body through mode override, which the filter config must allow)
+// and must fail closed when the processor is unavailable.
 // See deploy/envoy/envoy.yaml for a working filter configuration.
 package extproc
 
@@ -20,6 +22,7 @@ import (
 	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	extprocfilterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/grpc/codes"
@@ -51,6 +54,10 @@ type Server struct {
 	m     *metrics.Filter
 	// channels holds batch-settlement channel state; nil refuses vouchers.
 	channels *payerstate.Channels
+	// answer: what is done with a paid 2xx answer before charging for it.
+	answer    AnswerCheck
+	answerMax int
+	shapes    shapes
 }
 
 // Options configures a Server.
@@ -74,6 +81,13 @@ type Options struct {
 	// refused, not passed on for free. Needs the filter attached to the
 	// whole listener.
 	RefuseUnpriced []string
+	// AnswerCheck: off (default), watch or enforce. With watch or enforce,
+	// a paid 2xx answer that may be JSON is buffered and checked before it
+	// is charged; Envoy's filter config must allow mode override.
+	AnswerCheck AnswerCheck
+	// AnswerMaxBytes caps the answers checked (larger ones are charged
+	// unchecked). Default DefaultAnswerMaxBytes.
+	AnswerMaxBytes int
 }
 
 func NewServer(table *pricing.Table, state payerstate.PayerState, o Options) *Server {
@@ -87,6 +101,13 @@ func NewServer(table *pricing.Table, state payerstate.PayerState, o Options) *Se
 	s.opts.MinRemaining, s.opts.Contract = o.MinRemaining, o.Contract
 	if s.opts.MinRemaining == 0 {
 		s.opts.MinRemaining = 10 * time.Second
+	}
+	s.answer, s.answerMax = o.AnswerCheck, o.AnswerMaxBytes
+	if s.answer == "" {
+		s.answer = AnswerCheckOff
+	}
+	if s.answerMax <= 0 {
+		s.answerMax = DefaultAnswerMaxBytes
 	}
 	s.table.Store(table)
 	return s
@@ -119,6 +140,11 @@ type txn struct {
 	depositTx, depositAmount string
 	// extend asks Envoy for more time on the current message.
 	extend func(time.Duration)
+	// awaitBody: the answer is being checked; the charge waits for its body.
+	awaitBody bool
+	heldAt    time.Time // when the answer's headers arrived (awaitBody)
+	plan      answerPlan
+	head      bool // a HEAD request: its answer has no body
 }
 
 func (t *txn) paid() bool { return t.payment != nil || t.voucher != nil }
@@ -136,6 +162,10 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 	// reply), an uncommitted reservation is released: nobody is charged
 	// unless a 2xx was observed.
 	defer s.release(t, "stream_closed")
+	// The answer's body was asked for but never came (a filter config
+	// without allow_mode_override, or the stream ended mid-answer): charge
+	// as an unchecked answer would have been, not free.
+	defer s.chargeWithoutBody(t)
 
 	for {
 		req, err := stream.Recv()
@@ -158,12 +188,12 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 				stream.Send(&extprocv3.ProcessingResponse{OverrideMessageTimeout: durationpb.New(d)})
 			})
 
-		// Bodies and trailers are not needed; answer them so a gateway
-		// configured to send them does not stall.
+		// Other bodies and trailers are not needed; answer them so a
+		// gateway configured to send them does not stall.
 		case *extprocv3.ProcessingRequest_RequestBody:
 			resp = &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_RequestBody{RequestBody: &extprocv3.BodyResponse{}}}
 		case *extprocv3.ProcessingRequest_ResponseBody:
-			resp = &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ResponseBody{ResponseBody: &extprocv3.BodyResponse{}}}
+			resp = s.onResponseBody(stream.Context(), t, m.ResponseBody)
 		case *extprocv3.ProcessingRequest_RequestTrailers:
 			resp = &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_RequestTrailers{RequestTrailers: &extprocv3.TrailersResponse{}}}
 		case *extprocv3.ProcessingRequest_ResponseTrailers:
@@ -190,6 +220,7 @@ func (s *Server) onRequestHeaders(ctx context.Context, t *txn, h *extprocv3.Http
 // decide handles request headers and names the decision it took.
 func (s *Server) decide(ctx context.Context, t *txn, h *extprocv3.HttpHeaders, envoyRoute string) (*extprocv3.ProcessingResponse, string) {
 	hdr := indexHeaders(h.GetHeaders())
+	t.head = hdr[":method"] == "HEAD"
 	t.scrubSet, t.scrubRemove = scrub(h.GetHeaders().GetHeaders())
 	route := s.table.Load().Match(hdr[":authority"], hdr[":path"], envoyRoute)
 	if route == nil && s.table.Load().Refused(envoyRoute) {
@@ -248,6 +279,13 @@ func (s *Server) decide(ctx context.Context, t *txn, h *extprocv3.HttpHeaders, e
 			reason += "; missing required query parameter: " + strings.Join(missing, ", ") + " (a paid request without it is refused and not charged)"
 		}
 		return s.challenge(route, resource, typev3.StatusCode_PaymentRequired, reason, "challenge"), metrics.DecisionChallenged
+	}
+	// A paid HEAD would be charged for headers only. Refused before its
+	// payment is looked at: nothing reserved, nothing charged. An unpaid
+	// HEAD still gets its 402 above.
+	if t.head {
+		return immediate(typev3.StatusCode_MethodNotAllowed, []*corev3.HeaderValueOption{setHeader("allow", "GET, POST")},
+			[]byte(`{"error":"paid_head_refused","message":"a paid request cannot be HEAD: it would be charged for headers only; nothing was charged"}`), "x402_paid_head"), "refused"
 	}
 	var payload x402.PaymentPayload
 	if err := x402.DecodeHeader(raw, &payload); err != nil {
@@ -339,7 +377,7 @@ func (s *Server) decide(ctx context.Context, t *txn, h *extprocv3.HttpHeaders, e
 
 	// The backend never sees the signed payment, only who paid.
 	return t.pass(
-		[]*corev3.HeaderValueOption{setHeader(HeaderPayer, payment.Payer.String())},
+		s.answerEncoding(hdr, setHeader(HeaderPayer, payment.Payer.String())),
 		[]string{x402.HeaderPaymentSignature},
 	), metrics.DecisionReserved
 }
@@ -372,8 +410,103 @@ func (s *Server) onResponseHeaders(ctx context.Context, t *txn, h *extprocv3.Htt
 		s.release(t, "backend_status_"+strconv.Itoa(code))
 		return continueResponse(nil)
 	}
+	if s.answer != AnswerCheckOff {
+		p := planAnswer(t.route, code, t.head, indexHeaders(h.GetHeaders()))
+		if p.check && h.GetEndOfStream() {
+			// No body follows (an empty answer): Envoy will send no body
+			// message, so judge it here, while the headers can still be
+			// replaced or carry PAYMENT-RESPONSE.
+			v := s.checkAnswer(t.route, p, nil, true)
+			s.m.AnswerCheck(t.route.Name, v)
+			set, imm := s.judgeAnswer(ctx, t, v, extend)
+			if imm != nil {
+				return imm
+			}
+			return continueResponse(set)
+		}
+		if p.check {
+			// Charge on the body, once it has been checked. Envoy holds the
+			// headers until then.
+			t.plan, t.awaitBody, t.heldAt = p, true, time.Now()
+			r := continueResponse(nil)
+			r.ModeOverride = &extprocfilterv3.ProcessingMode{
+				ResponseBodyMode:    extprocfilterv3.ProcessingMode_BUFFERED_PARTIAL,
+				ResponseTrailerMode: extprocfilterv3.ProcessingMode_SKIP,
+			}
+			return r
+		}
+		s.m.AnswerCheck(t.route.Name, p.verdict)
+	}
+	set, imm := s.charge(ctx, t, extend, true)
+	if imm != nil {
+		return imm
+	}
+	return continueResponse(set)
+}
+
+// onResponseBody checks a buffered answer, then charges for it, or (enforce)
+// refuses it.
+func (s *Server) onResponseBody(ctx context.Context, t *txn, b *extprocv3.HttpBody) *extprocv3.ProcessingResponse {
+	if !t.awaitBody || t.finished {
+		return bodyResponse(nil)
+	}
+	t.awaitBody = false
+	arrived := time.Now()
+	v := s.checkAnswer(t.route, t.plan, b.GetBody(), b.GetEndOfStream())
+	s.m.AnswerCheck(t.route.Name, v)
+	s.m.AnswerHold(arrived.Sub(t.heldAt), time.Since(arrived))
+	set, imm := s.judgeAnswer(ctx, t, v, t.extend)
+	if imm != nil {
+		return imm
+	}
+	return bodyResponse(set)
+}
+
+// judgeAnswer acts on a checked answer's verdict: in enforce mode an
+// unusable answer is released and replaced by an error; otherwise the
+// payment is charged (a sync route waits for settlement). It returns the
+// headers to add to the answer, or a response that replaces it.
+func (s *Server) judgeAnswer(ctx context.Context, t *txn, v string, extend func(time.Duration)) ([]*corev3.HeaderValueOption, *extprocv3.ProcessingResponse) {
+	if refusing(v) {
+		if s.answer == AnswerCheckEnforce {
+			s.log.Info("answer unusable; not charged", "route", t.route.Name, "verdict", v)
+			s.release(t, "answer_"+v)
+			// 503, not 502: proxies in front of the gateway (Cloudflare
+			// among them) replace an origin's 502 and 504 with their own
+			// error page, and the buyer would never see the reason. The
+			// payment was released, so retrying with it is fine.
+			return nil, immediate(typev3.StatusCode_ServiceUnavailable, []*corev3.HeaderValueOption{
+				setHeader("content-type", "application/json"),
+				setHeader("cache-control", "no-store"),
+			}, []byte(`{"error":"unusable_answer","reason":"`+v+`","message":"the API answered, but not with a usable answer; nothing was charged"}`), "x402_answer_"+v)
+		}
+		s.log.Info("answer unusable (watch mode: charged)", "route", t.route.Name, "verdict", v)
+	}
+	return s.charge(ctx, t, extend, true)
+}
+
+// chargeWithoutBody charges a checked answer whose body never came.
+func (s *Server) chargeWithoutBody(t *txn) {
+	if !t.awaitBody || t.finished {
+		return
+	}
+	t.awaitBody = false
+	s.m.AnswerCheck(t.route.Name, VerdictNoBody)
+	// Either the upstream failed mid-answer, or Envoy ignored the mode
+	// override (its ext_proc config lacks allow_mode_override): then every
+	// checked answer ends up here, charged after it was sent.
+	s.log.Warn("paid answer's body never reached the filter; charged unchecked (check allow_mode_override in Envoy's ext_proc config if this repeats)", "route", t.route.Name)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	s.charge(ctx, t, func(time.Duration) {}, false)
+}
+
+// charge commits the payment for a served answer. It returns the headers to
+// add to the answer, or a response that replaces it. wait: a sync route
+// holds the answer until the payment has settled.
+func (s *Server) charge(ctx context.Context, t *txn, extend func(time.Duration), wait bool) ([]*corev3.HeaderValueOption, *extprocv3.ProcessingResponse) {
 	if t.voucher != nil {
-		return s.commitVoucher(ctx, t)
+		return s.commitVoucher(ctx, t), nil
 	}
 
 	body, err := json.Marshal(settle.Job{
@@ -401,9 +534,9 @@ func (s *Server) onResponseHeaders(ctx context.Context, t *txn, h *extprocv3.Htt
 		s.log.Error("commit failed; response withheld", "route", t.route.Name, "payer", t.payment.Payer.Hex(), "err", err)
 		t.finished = true
 		if errors.Is(err, payerstate.ErrExpired) {
-			return immediate(typev3.StatusCode_PaymentRequired, nil, []byte(`{"error":"payment_expired","message":"the payment authorization expired before the response was ready; nothing was charged"}`), "x402_commit_expired")
+			return nil, immediate(typev3.StatusCode_PaymentRequired, nil, []byte(`{"error":"payment_expired","message":"the payment authorization expired before the response was ready; nothing was charged"}`), "x402_commit_expired")
 		}
-		return immediate(typev3.StatusCode_ServiceUnavailable, nil, []byte(`{"error":"payment_unavailable","message":"the payment could not be recorded; nothing was charged"}`), "x402_commit_failed")
+		return nil, immediate(typev3.StatusCode_ServiceUnavailable, nil, []byte(`{"error":"payment_unavailable","message":"the payment could not be recorded; nothing was charged"}`), "x402_commit_failed")
 	}
 	t.finished = true
 	s.m.Request(t.route.Name, metrics.DecisionServed)
@@ -417,7 +550,7 @@ func (s *Server) onResponseHeaders(ctx context.Context, t *txn, h *extprocv3.Htt
 		Transaction: "",
 		Network:     t.payment.Offer.Wire.Network,
 	}
-	if w, ok := s.state.(resultWaiter); ok && t.route.Sync {
+	if w, ok := s.state.(resultWaiter); ok && t.route.Sync && wait {
 		// Sync: hold the response until the payment has settled.
 		extend(t.route.SyncTimeout + 2*time.Second)
 		start := time.Now()
@@ -433,7 +566,7 @@ func (s *Server) onResponseHeaders(ctx context.Context, t *txn, h *extprocv3.Htt
 			s.log.Warn("sync settlement failed; withholding response", "route", t.route.Name, "payer", t.payment.Payer.Hex(), "reason", res.Reason)
 			sr.Success, sr.ErrorReason = false, res.Reason
 			value, _ := x402.EncodeHeader(sr)
-			return immediate(typev3.StatusCode_PaymentRequired, []*corev3.HeaderValueOption{
+			return nil, immediate(typev3.StatusCode_PaymentRequired, []*corev3.HeaderValueOption{
 				setHeader(x402.HeaderPaymentResponse, value),
 				setHeader("content-type", "application/json"),
 				setHeader("cache-control", "no-store"),
@@ -449,12 +582,12 @@ func (s *Server) onResponseHeaders(ctx context.Context, t *txn, h *extprocv3.Htt
 	}
 	value, err := x402.EncodeHeader(sr)
 	if err != nil {
-		return continueResponse(nil)
+		return nil, nil
 	}
-	return continueResponse([]*corev3.HeaderValueOption{
+	return []*corev3.HeaderValueOption{
 		setHeader(x402.HeaderPaymentResponse, value),
 		appendHeader("access-control-expose-headers", "PAYMENT-RESPONSE"),
-	})
+	}, nil
 }
 
 func (s *Server) release(t *txn, why string) {
@@ -725,6 +858,16 @@ func continueRequest(set []*corev3.HeaderValueOption, remove []string) *extprocv
 		}
 	}
 	return &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_RequestHeaders{RequestHeaders: hr}}
+}
+
+// bodyResponse lets a buffered answer through with the given header changes
+// (Envoy has held its headers until now).
+func bodyResponse(set []*corev3.HeaderValueOption) *extprocv3.ProcessingResponse {
+	br := &extprocv3.BodyResponse{}
+	if len(set) > 0 {
+		br.Response = &extprocv3.CommonResponse{HeaderMutation: &extprocv3.HeaderMutation{SetHeaders: set}}
+	}
+	return &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ResponseBody{ResponseBody: br}}
 }
 
 func continueResponse(set []*corev3.HeaderValueOption) *extprocv3.ProcessingResponse {

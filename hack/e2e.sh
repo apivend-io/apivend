@@ -64,6 +64,10 @@ class H(BaseHTTPRequestHandler):
             time.sleep(0.6)
         code = 500 if self.path.startswith("/search/fail") else 200
         body = json.dumps({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}}).encode()
+        if self.path.startswith("/search/broken"):
+            body = b'{"error":"upstream timed out"}'  # an error dressed as a 200
+        if self.path.startswith("/search/empty"):
+            body = b""  # a 200 with no body: Envoy ends the stream on the headers
         self.send_response(code)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(body)))
@@ -125,7 +129,7 @@ printf '0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a' >"$L
 
 # Hosted source first, direct RPC as the fallback.
 bin/x402-filter -listen 127.0.0.1:9002 -metrics 127.0.0.1:9102 -config "$LOGS/routes.yaml" \
-  -redis "127.0.0.1:$REDIS_PORT" -hosted-state http://127.0.0.1:9444 -rpc "$RPC" >"$LOGS/filter.log" 2>&1 &
+  -redis "127.0.0.1:$REDIS_PORT" -hosted-state http://127.0.0.1:9444 -rpc "$RPC" -answer-check enforce >"$LOGS/filter.log" 2>&1 &
 filter_pid=$!
 pids+=("$filter_pid")
 
@@ -174,6 +178,15 @@ check "balance came from the hosted source" grep -q '"msg":"payment reserved".*"
 bin/x402-pay "$GW/search/fail" >/dev/null 2>"$LOGS/fail.err" || true
 check "backend 500 is passed through"      grep -q '^< 500' "$LOGS/fail.err"
 check "backend 500 is not charged"         grep -q '"msg":"payment released".*backend_status_500' "$LOGS/filter.log"
+bin/x402-pay "$GW/search/broken" >"$LOGS/broken.out" 2>"$LOGS/broken.err" || true
+check "unusable 200 answer gets 503"        grep -q '^< 503' "$LOGS/broken.err"
+check "unusable answer is not charged"      grep -q '"msg":"payment released".*answer_error_only' "$LOGS/filter.log"
+check "unusable answer is not passed on"    bash -c "! grep -q 'upstream timed out' '$LOGS/broken.out'"
+bin/x402-pay "$GW/search/empty" >/dev/null 2>"$LOGS/empty.err" || true
+check "empty 200 answer gets 503"           grep -q '^< 503' "$LOGS/empty.err"
+check "empty answer is not charged"         grep -q '"msg":"payment released".*answer_empty' "$LOGS/filter.log"
+bin/x402-pay -X HEAD "$GW/search" >/dev/null 2>"$LOGS/head.err" || true
+check "paid HEAD is refused (405)"           grep -q '^< 405' "$LOGS/head.err"
 check "exactly one payment committed"      test "$(logged filter '"msg":"payment committed"')" = 1
 
 for _ in $(seq 1 50); do [[ "$(logged settler '"msg":"payment settled"')" = 1 ]] && break; sleep 0.1; done

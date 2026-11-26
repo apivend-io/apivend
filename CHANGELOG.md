@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.6.0
+
+### Added
+
+- **Buyer protection: an answer is checked before it is charged.** With
+  `-answer-check` (chart: `filter.answerCheck`) set to `enforce`, the
+  filter holds a paid 2xx answer that may be JSON and looks at its form
+  before charging. An answer that is empty, does not parse (cut off), is
+  an HTML page where JSON was expected, is an object of only error fields
+  (`{"error":"upstream timed out"}`), or lacks at least half of the fields
+  the route reliably returns is not charged: the reservation is released
+  and the caller gets `503` with `{"error":"unusable_answer","reason":...}`.
+  The answer itself is never passed on. Content is never judged: an empty
+  list or "not found" in the normal structure is an answer and is charged.
+  `watch` runs the same check and only counts the verdicts; `off` (the
+  default) charges on the headers as before. JSON is expected when the
+  answer says `application/json` (or `+json`) or the route's discovery
+  output is JSON; answers over 256 KiB (`-answer-check-max-bytes`), streams
+  and other content types are charged unchecked. The check needs Envoy's
+  ext_proc mode override (see the install guide). Metrics:
+  `x402_answer_checks_total{route,verdict}` and
+  `x402_answer_hold_seconds{part}` (about a millisecond in our production).
+- With the check on, a paid request asks the API for `gzip` or no
+  compression, so the answer can be read: proxies such as Cloudflare offer
+  `br` and `zstd` on the caller's behalf.
+
+### Changed
+
+- **A paid HEAD request is refused before payment.** It would be charged
+  for headers only: `405`, nothing reserved. An unpaid HEAD still gets its
+  402 with the terms.
+- **The controller's policies allow mode override** (`allowModeOverride`),
+  and so does `deploy/envoy/envoy.yaml`. Nothing changes while the answer
+  check is off.
+
 ## v0.5.0
 
 ### Changed

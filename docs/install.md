@@ -156,6 +156,26 @@ skips the compliance screening some facilitators do.
   until `enabled: true`; some directories list a route after its first
   settled payment, with no review.
 
+### Buyer protection
+
+`--set filter.answerCheck=watch` checks every paid 2xx answer that may be
+JSON before charging and counts the verdict in
+`x402_answer_checks_total{route,verdict}`, still charging everything.
+Run it for a while and look at the verdicts; then `enforce` stops charging
+for the unusable ones (empty, `not_json`, `html`, `error_only`,
+`missing_fields`), which callers receive as `503` `unusable_answer`.
+
+The filter gets the answer's body through ext_proc's mode override, which
+Envoy honours only when the filter's config allows it: the controller's
+policies set `allowModeOverride: true`, and `deploy/envoy/envoy.yaml` sets
+`allow_mode_override: true`. Any `EnvoyExtensionPolicy` or Envoy config of
+your own that runs the filter needs it too. Without it the body never
+reaches the filter, answers are charged unchecked after they were sent
+(`verdict="no_body"`), and the filter logs a warning for each.
+
+If your API's normal answer looks like an error object, describe it in the
+route's `discovery` output example: such answers are then charged.
+
 ### Securing Redis
 
 Redis holds the payments in flight: the funds held while a request is

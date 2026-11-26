@@ -37,6 +37,8 @@ func main() {
 		configMap       = flag.String("config-configmap", "", "read the price table from this ConfigMap through the Kubernetes API instead of -config, so every replica sees a change within about a second (a mounted ConfigMap takes up to a minute, at a different moment in each pod)")
 		configKey       = flag.String("config-configmap-key", "routes.yaml", "key of the price table in -config-configmap")
 		configNS        = flag.String("config-namespace", "", "namespace of -config-configmap; default env POD_NAMESPACE, then the pod's own namespace")
+		answerCheck     = flag.String("answer-check", "off", "what to do with a paid 2xx answer before charging: off (charge on the headers), watch (check it and count the verdict, charge anyway) or enforce (an unusable answer is not charged; the buyer gets 503). watch and enforce need Envoy's ext_proc config to allow mode override")
+		answerMax       = flag.Int("answer-check-max-bytes", extproc.DefaultAnswerMaxBytes, "answers larger than this are charged unchecked")
 		refuseUnpriced  = flag.String("refuse-unpriced-routes", "", "comma-separated Envoy route-name patterns that are always priced, per-segment globs (e.g. httproute/t-*/p-*): such a route missing from the price table is refused, not served free")
 		minRemaining    = flag.Duration("min-validity-remaining", 30*time.Second, "reject authorizations that expire sooner than this")
 		redisAddr       = flag.String("redis", os.Getenv("X402_REDIS"), "Redis address or URL for shared payer state (env X402_REDIS); empty = in-memory, single replica")
@@ -200,7 +202,13 @@ func main() {
 			refuse = append(refuse, p)
 		}
 	}
-	srv := extproc.NewServer(table, state, extproc.Options{Logger: log, MinRemaining: *minRemaining, Metrics: m, Contract: contract, Channels: channels, RefuseUnpriced: refuse})
+	check, ok := extproc.ParseAnswerCheck(*answerCheck)
+	if !ok {
+		log.Error("-answer-check must be off, watch or enforce")
+		os.Exit(2)
+	}
+	srv := extproc.NewServer(table, state, extproc.Options{Logger: log, MinRemaining: *minRemaining, Metrics: m, Contract: contract, Channels: channels, RefuseUnpriced: refuse,
+		AnswerCheck: check, AnswerMaxBytes: *answerMax})
 
 	lis, err := net.Listen("tcp", *listen)
 	if err != nil {

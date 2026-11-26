@@ -81,6 +81,9 @@ spec:
             - -min-validity-remaining={{ .Values.filter.minValidityRemaining }}
             - -chain-read-timeout={{ .Values.filter.chainReadTimeout }}
             - -credit-confirmations={{ .Values.filter.creditConfirmations }}
+            {{- if and .Values.filter.answerCheck (ne (toString .Values.filter.answerCheck) "off") }}
+            - -answer-check={{ .Values.filter.answerCheck }}
+            {{- end }}
             {{- with .Values.filter.refuseUnpricedRoutes }}
             - -refuse-unpriced-routes={{ join "," . }}
             {{- end }}

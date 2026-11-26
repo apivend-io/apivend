@@ -106,7 +106,7 @@ func (s *Server) decideVoucher(ctx context.Context, t *txn, hdr map[string]strin
 	s.log.Info("voucher reserved", "route", route.Name, "payer", v.Config.Payer.Hex(), "charged", hold.Charged.String(),
 		"price", v.Offer.Amount.String(), "network", v.Offer.Wire.Network)
 	return t.pass(
-		[]*corev3.HeaderValueOption{setHeader(HeaderPayer, v.Config.Payer.String())},
+		s.answerEncoding(hdr, setHeader(HeaderPayer, v.Config.Payer.String())),
 		[]string{x402.HeaderPaymentSignature},
 	), metrics.DecisionReserved
 }
@@ -114,14 +114,14 @@ func (s *Server) decideVoucher(ctx context.Context, t *txn, hdr map[string]strin
 // commitVoucher charges the held channel after a 2xx and answers with the
 // batch payment response: no transaction (nothing moved on chain), the
 // charge and the channel snapshot.
-func (s *Server) commitVoucher(ctx context.Context, t *txn) *extprocv3.ProcessingResponse {
+func (s *Server) commitVoucher(ctx context.Context, t *txn) []*corev3.HeaderValueOption {
 	t.finished = true
 	v := t.voucher
 	charged, err := s.channels.Commit(ctx, t.hold)
 	if err != nil {
 		s.m.Request(t.route.Name, metrics.DecisionCommitLost)
 		s.log.Error("voucher commit failed; served request will not be charged", "route", t.route.Name, "payer", v.Config.Payer.Hex(), "err", err)
-		return continueResponse(nil)
+		return nil
 	}
 	s.m.Request(t.route.Name, metrics.DecisionServed)
 	s.log.Info("voucher committed", "route", t.route.Name, "payer", v.Config.Payer.Hex(), "amount", v.Offer.Amount.String(), "charged", charged.String())
@@ -137,12 +137,12 @@ func (s *Server) commitVoucher(ctx context.Context, t *txn) *extprocv3.Processin
 	}
 	value, err := x402.EncodeHeader(sr)
 	if err != nil {
-		return continueResponse(nil)
+		return nil
 	}
-	return continueResponse([]*corev3.HeaderValueOption{
+	return []*corev3.HeaderValueOption{
 		setHeader(x402.HeaderPaymentResponse, value),
 		appendHeader("access-control-expose-headers", "PAYMENT-RESPONSE"),
-	})
+	}
 }
 
 // corrective is the 402 that lets a client whose cumulative amount is out

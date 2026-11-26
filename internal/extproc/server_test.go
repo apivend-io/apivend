@@ -961,3 +961,21 @@ func TestMissingRequiredParameter(t *testing.T) {
 		t.Fatalf("paid with the parameter: %v", resp.Response)
 	}
 }
+
+// A paid HEAD is refused before its payment is looked at; an unpaid HEAD
+// still gets the terms.
+func TestPaidHeadRefused(t *testing.T) {
+	state := &spyState{Memory: payerstate.NewMemory(), events: make(chan string, 16)}
+	c := serveWith(t, state, extproc.Options{})
+	pr := challenge(t, open(t, c).request("/search", ":method", "HEAD"), 402)
+	e := open(t, c)
+	im := e.request("/search", ":method", "HEAD", "payment-signature", pay(t, pr)).GetImmediateResponse()
+	if im == nil || im.Status.Code != 405 {
+		t.Fatalf("want 405, got %v", im)
+	}
+	state.expectNone(t)
+	// The same payment is still good for a GET.
+	if e2 := open(t, c); e2.request("/search", "payment-signature", pay(t, pr)).GetRequestHeaders() == nil {
+		t.Fatal("GET with a fresh payment refused")
+	}
+}

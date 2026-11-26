@@ -26,6 +26,7 @@ func main() {
 	method := flag.String("X", "GET", "HTTP method")
 	flag.StringVar(&asWallet, "as", "", "pay from this contract wallet (EIP-1271), signing with X402_PRIVATE_KEY as its owner")
 	host := flag.String("host", "", "override the Host header")
+	flag.StringVar(&saveTo, "save", "", "also write the PAYMENT-SIGNATURE header sent to this file (to replay it later, e.g. in a crash test)")
 	var headers headerFlags
 	flag.Var(&headers, "H", "extra request header \"Name: value\" (repeatable); X402_HEADERS adds one per line, for values that should not appear in the process list")
 	flag.Usage = func() {
@@ -50,6 +51,9 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// saveTo: where -save writes the payment header.
+var saveTo string
 
 // headerFlags collects -H "Name: value" flags, e.g. a Cloudflare Access
 // service token for a gated route.
@@ -132,6 +136,11 @@ func run(method, url, host string, headers headerFlags) error {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "> paying %s atomic units on %s from %s\n", payment.Accepted.Amount, payment.Accepted.Network, w.Payer())
+	if saveTo != "" {
+		if err := os.WriteFile(saveTo, []byte(sig), 0o600); err != nil {
+			return fmt.Errorf("-save: %w", err)
+		}
+	}
 
 	resp, body, err = do(sig)
 	if err != nil {

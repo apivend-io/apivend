@@ -47,6 +47,9 @@ static_resources:
                         response_body_mode: NONE
                         request_trailer_mode: SKIP
                         response_trailer_mode: SKIP
+                      # The filter asks for a paid answer's body when it
+                      # checks the answer before charging (-answer-check).
+                      allow_mode_override: true
                       # Lets the price table match on the selected route's name.
                       request_attributes: ["xds.route_name"]
                       message_timeout: 0.2s

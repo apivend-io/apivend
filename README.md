@@ -28,6 +28,11 @@ answered with a 2xx. Payments go from the caller's wallet straight to yours.
 - **Charges only for answers.** A reservation becomes a charge only when your
   API answers 2xx. Errors, timeouts and aborted requests cost the caller
   nothing.
+- **Protects buyers from broken answers.** Optionally, the gateway looks at
+  the form of a 2xx answer before charging: an empty body, JSON cut off, an
+  HTML page where JSON was expected, or an error dressed as a 200 is not
+  charged and never reaches the caller. Content is never judged: "no
+  results" is an answer.
 - **Settles after the response, or before it.** By default the response goes
   out first and the payment settles about a second later, with a cap on what
   any one payer can owe in the meantime. A route can instead settle first and

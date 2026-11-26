@@ -32,7 +32,9 @@ response to decide whether to charge.
 5. Your API answers. On a 2xx, the reservation becomes a charge and a
    settlement job is queued, in one Redis script. On anything else, or when
    the request is aborted, the reservation is released: nobody is charged,
-   and the same authorization can be used again.
+   and the same authorization can be used again. With the answer check on,
+   a 2xx that may be JSON is held until its body has arrived; an obviously
+   unusable one is released and replaced by a 503 (see the install guide).
 6. The settler takes the job with the nearest deadline (authorizations
    expire), settles it, writes the receipt and lowers the payer's unsettled
    total.
