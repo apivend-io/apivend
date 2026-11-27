@@ -40,7 +40,7 @@ kubectl -n x402-system create secret generic x402-rpc \
 ### 2. The chart
 
 ```sh
-helm install x402 oci://ghcr.io/apivend-io/charts/x402 --version 0.6.0 \
+helm install x402 oci://ghcr.io/apivend-io/charts/x402 --version 0.7.0 \
   -n x402-system \
   --set redis.url=redis://redis.x402-system.svc:6379/0 \
   --set 'rpc[0].network=base-sepolia' \
@@ -158,12 +158,46 @@ skips the compliance screening some facilitators do.
 
 ### Buyer protection
 
-`--set filter.answerCheck=watch` checks every paid 2xx answer that may be
-JSON before charging and counts the verdict in
-`x402_answer_checks_total{route,verdict}`, still charging everything.
-Run it for a while and look at the verdicts; then `enforce` stops charging
-for the unusable ones (empty, `not_json`, `html`, `error_only`,
-`missing_fields`), which callers receive as `503` `unusable_answer`.
+By default (`filter.answerCheck: enforce`) the filter checks every paid 2xx
+answer that may be JSON before charging, and does not charge for the
+unusable ones (empty, `not_json`, `html`, `error_only`, `missing_fields`),
+which callers receive as `503` `unusable_answer`. The verdicts are counted
+in `x402_answer_checks_total{route,verdict}`. `watch` runs the same check
+but charges everything; `off` charges on the headers, unchecked.
+
+On a `sync` route, a paid GET answer the check held is also kept for a
+minute once its payment has settled (`filter.redeliverWindow`, default
+`60s`, at most `1h`, `"0s"` turns it off). When the same payer sends the
+same request again within that time with a valid payment (a client whose
+connection dropped signs a new one; some resend the same one), the filter
+returns the kept answer with its original `PAYMENT-RESPONSE` and the header
+`x-x402-redelivered: true`, does not call your API, and does not charge the
+new payment. Same payer, method, host, path and query only, and the same
+`Authorization`, `Proxy-Authorization`, `Cookie`, `X-API-Key`, `Accept`,
+`Accept-Language`, `Accept-Encoding` and `Origin` headers (one wallet may
+pay for many users of your API). POST and other methods are always charged
+(a repeat may be a second action), and so are range requests, GET requests
+with a `Content-Length` body, answers other than `200`, and answers whose
+`Vary` names a header outside that list. Kept answers live in the gateway's
+Redis until the window ends, with their `content-type`, `content-encoding`,
+`content-language`, `vary`, `cache-control`, `x-content-type-options` and
+`access-control-allow-origin` headers only. Only answers the check holds
+are kept: JSON up to 256 KiB (the filter's `-answer-check-max-bytes`). A
+repeat of a larger or non-JSON answer is charged again.
+
+The payment the answer was charged to, resent, is accepted as well (some
+clients do this after a dropped connection); a payment already used for
+another request is refused as `payment_already_used`. A settled payment is
+public on chain, so someone who also knows the exact request could fetch
+its kept answer within the window.
+
+A repeat that arrives while the first call is still being answered (a
+client that timed out and retried) waits for it, up to the route's
+settlement wait (`settlement.syncTimeout`, 10 s by default), and gets its
+answer once it is kept. If the first call fails, or takes longer than that,
+the repeat goes on as a paid call of its own. At most 8 repeats of one
+request, and 256 in all per filter replica, wait at once; others are charged.
+If your API's answers depend on who paid, set `filter.redeliverWindow: "0s"`.
 
 The filter gets the answer's body through ext_proc's mode override, which
 Envoy honours only when the filter's config allows it: the controller's

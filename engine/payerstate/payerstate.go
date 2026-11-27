@@ -143,6 +143,15 @@ func (m *Memory) Reserve(_ context.Context, req Request) (ReservationID, error) 
 	return id, nil
 }
 
+// NonceUsed reports whether an authorization is held or charged and not yet
+// expired.
+func (m *Memory) NonceUsed(_ context.Context, chainID, asset, payer, nonce string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	exp, ok := m.held[makeID(chainID, asset, payer, nonce)]
+	return ok && m.now().Before(exp), nil
+}
+
 func (m *Memory) Release(_ context.Context, id ReservationID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

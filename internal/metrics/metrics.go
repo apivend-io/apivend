@@ -30,6 +30,7 @@ const (
 	DecisionServed      = "served"        // backend 2xx, reservation committed
 	DecisionReleased    = "released"      // backend failed or request aborted; nobody charged
 	DecisionCommitLost  = "commit_failed" // backend 2xx but the commit failed: revenue lost
+	DecisionRedelivered = "redelivered"   // a repeat of a paid GET got the kept answer; its new payment was not charged
 )
 
 func newRegistry() *prometheus.Registry {

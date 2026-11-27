@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -126,7 +127,10 @@ func main() {
 	}())
 
 	if *replay {
-		code, hdr, _, err := get(*url, sig)
+		// The same payment for another request: a gateway that keeps paid
+		// answers for a repeat (redelivery) keys them on the request, so
+		// this must be refused whatever the gateway does with a repeat.
+		code, hdr, _, err := get(withQuery(*url, "x402check=replay"), sig)
 		check("replayed payment is refused as payment_already_used", func() error {
 			if err != nil {
 				return err
@@ -136,6 +140,21 @@ func main() {
 			}
 			if r := refusal(hdr); r != "payment_already_used" {
 				return fmt.Errorf("refused as %q", r)
+			}
+			return nil
+		}())
+		// The same payment for the same request: refused, or the kept
+		// answer again (marked, and never a second charge).
+		code, hdr, _, err = get(*url, sig)
+		check("repeated payment is refused or redelivered", func() error {
+			if err != nil {
+				return err
+			}
+			switch {
+			case code == http.StatusPaymentRequired && refusal(hdr) == "payment_already_used":
+			case code == http.StatusOK && hdr.Get("x-x402-redelivered") == "true":
+			default:
+				return fmt.Errorf("status %d (%s)", code, refusal(hdr))
 			}
 			return nil
 		}())
@@ -153,11 +172,12 @@ func main() {
 		var mu sync.Mutex
 		served, insufficient, other := 0, 0, map[string]int{}
 		var wg sync.WaitGroup
-		for _, s := range sigs {
+		for i, s := range sigs {
 			wg.Add(1)
-			go func(s string) {
+			go func(i int, s string) {
 				defer wg.Done()
-				code, hdr, _, err := get(*url, s)
+				// Each its own request, so none is a repeat of another.
+				code, hdr, _, err := get(withQuery(*url, fmt.Sprintf("x402check=%d", i)), s)
 				mu.Lock()
 				defer mu.Unlock()
 				switch {
@@ -170,7 +190,7 @@ func main() {
 				default:
 					other[fmt.Sprintf("%d %s", code, refusal(hdr))]++
 				}
-			}(s)
+			}(i, s)
 		}
 		wg.Wait()
 		check(fmt.Sprintf("%d concurrent payments: only the affordable number is served", *overspend), func() error {
@@ -188,6 +208,14 @@ func main() {
 		fmt.Printf("     served %d, refused %d\n", served, insufficient)
 	}
 	exit(failed)
+}
+
+// withQuery adds a query parameter to u.
+func withQuery(u, kv string) string {
+	if strings.Contains(u, "?") {
+		return u + "&" + kv
+	}
+	return u + "?" + kv
 }
 
 func exit(failed bool) {

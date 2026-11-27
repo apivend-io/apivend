@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.7.0
+
+### Changed
+
+- **The defaults are now the settings we run in production.** The answer
+  check is on: `-answer-check` (chart: `filter.answerCheck`) defaults to
+  `enforce`, where it was `off`. Set it to `off` to keep the old behaviour.
+  It needs Envoy's ext_proc mode override, which `deploy/envoy/envoy.yaml`
+  and the controller's policies already allow. An unquoted `off` in your
+  values (YAML reads it as `false`) still means off.
+
+### Added
+
+- **A repeated paid request is not charged twice.** A paid GET answer that
+  the answer check held, on a `sync` route once its payment has settled, is
+  kept for `-redeliver-window` (env `X402_REDELIVER_WINDOW`, chart
+  `filter.redeliverWindow`; default `60s`, at most `1h`, `0` turns it off).
+  When the same payer sends the same request (method, host, path and query,
+  and the headers that commonly pick the answer: `Authorization`,
+  `Proxy-Authorization`, `Cookie`, `X-API-Key`, `Accept`,
+  `Accept-Language`, `Accept-Encoding`, `Origin`) again within it, with a
+  new valid payment, the filter returns the kept answer with its original
+  `PAYMENT-RESPONSE` and `x-x402-redelivered: true`; the API is not called
+  and the new payment is never reserved or charged. This is for a buyer
+  whose connection dropped after the charge: x402 clients sign a new
+  payment on retry rather than resend the old one. Only GET; only answers
+  held whole (JSON up to 256 KiB: the answer check's limits apply); only
+  `exact` payments; only settled ones (an answer served before settlement
+  may yet go unpaid, so async routes and sync waits that time out keep
+  nothing); only `200` answers to requests without `Range` or a
+  `Content-Length` body, and not when the answer's `Vary` names a header
+  outside the list above. The payment the answer was charged to, resent, is
+  accepted too (a payment used for another request is not); since a settled
+  payment is public on chain, turn redelivery off if answers depend on who
+  paid (see the install guide). A repeat that arrives while the first call
+  is still being answered (a client that timed out) waits for it, up to the
+  route's settlement wait, instead of being charged too (at most 8 per
+  request and 256 per filter replica wait at once). Kept answers are in the
+  gateway's Redis until the window ends. Metric:
+  `x402_requests_total{decision="redelivered"}`.
+- `x402-check` checks replay protection with the used payment on another
+  request (still `402` `payment_already_used`), and accepts a redelivered
+  answer for the same request. An older `x402-check` reports redelivery as
+  a failed replay check. Its overspend payments each use their own query.
+
 ## v0.6.0
 
 ### Added

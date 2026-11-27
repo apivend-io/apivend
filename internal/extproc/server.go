@@ -58,6 +58,10 @@ type Server struct {
 	answer    AnswerCheck
 	answerMax int
 	shapes    shapes
+	// redeliver keeps paid GET answers for a repeat; nil: off.
+	redeliver    Redeliveries
+	redeliverTTL time.Duration
+	waiters      waiters // repeats waiting for a paid answer in flight
 }
 
 // Options configures a Server.
@@ -88,6 +92,14 @@ type Options struct {
 	// AnswerMaxBytes caps the answers checked (larger ones are charged
 	// unchecked). Default DefaultAnswerMaxBytes.
 	AnswerMaxBytes int
+	// Redeliveries, when set, keeps each paid GET answer the filter held
+	// whole (the answer check's buffered body) for RedeliverWindow: the same
+	// payer repeating the same request with a new valid payment gets it
+	// again, and the new payment is not charged.
+	Redeliveries Redeliveries
+	// RedeliverWindow defaults to DefaultRedeliverWindow, at most
+	// MaxRedeliverWindow.
+	RedeliverWindow time.Duration
 }
 
 func NewServer(table *pricing.Table, state payerstate.PayerState, o Options) *Server {
@@ -108,6 +120,13 @@ func NewServer(table *pricing.Table, state payerstate.PayerState, o Options) *Se
 	}
 	if s.answerMax <= 0 {
 		s.answerMax = DefaultAnswerMaxBytes
+	}
+	s.redeliver, s.redeliverTTL = o.Redeliveries, o.RedeliverWindow
+	if s.redeliverTTL <= 0 {
+		s.redeliverTTL = DefaultRedeliverWindow
+	}
+	if s.redeliverTTL > MaxRedeliverWindow {
+		s.redeliverTTL = MaxRedeliverWindow
 	}
 	s.table.Store(table)
 	return s
@@ -145,6 +164,14 @@ type txn struct {
 	heldAt    time.Time // when the answer's headers arrived (awaitBody)
 	plan      answerPlan
 	head      bool // a HEAD request: its answer has no body
+	// redeliverKey: this paid GET's answer is kept for a repeat under it.
+	redeliverKey string
+	answerHdr    map[string]string // the held answer's headers
+	answerStatus int
+	// claimed: this request holds the in-flight mark for redeliverKey;
+	// keeping: the answer is being kept, and the mark goes when it is.
+	claimed, keeping bool
+	flightToken      string // this request's in-flight mark, so it removes only its own
 }
 
 func (t *txn) paid() bool { return t.payment != nil || t.voucher != nil }
@@ -161,6 +188,7 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 	// Whatever ends the stream (client reset, backend timeout, Envoy local
 	// reply), an uncommitted reservation is released: nobody is charged
 	// unless a 2xx was observed.
+	defer s.unclaim(t)
 	defer s.release(t, "stream_closed")
 	// The answer's body was asked for but never came (a filter config
 	// without allow_mode_override, or the stream ended mid-answer): charge
@@ -219,6 +247,7 @@ func (s *Server) onRequestHeaders(ctx context.Context, t *txn, h *extprocv3.Http
 
 // decide handles request headers and names the decision it took.
 func (s *Server) decide(ctx context.Context, t *txn, h *extprocv3.HttpHeaders, envoyRoute string) (*extprocv3.ProcessingResponse, string) {
+	arrived := time.Now()
 	hdr := indexHeaders(h.GetHeaders())
 	t.head = hdr[":method"] == "HEAD"
 	t.scrubSet, t.scrubRemove = scrub(h.GetHeaders().GetHeaders())
@@ -315,6 +344,26 @@ func (s *Server) decide(ctx context.Context, t *txn, h *extprocv3.HttpHeaders, e
 			return immediate(typev3.StatusCode_ServiceUnavailable, []*corev3.HeaderValueOption{setHeader("retry-after", "2")}, []byte(`{"error":"payment verification unavailable"}`), "x402_verify_unavailable"), metrics.DecisionUnavailable
 		}
 		return s.challenge(route, resource, typev3.StatusCode_PaymentRequired, verr.Reason, "rejected"), metrics.DecisionRejected
+	}
+
+	if s.redeliver != nil && hdr[":method"] == "GET" && redeliverable(hdr) {
+		key := redeliveryKey(payment.Offer.Wire.Network, payment.Offer.Domain.VerifyingContract.Hex(), payment.Payer.Hex(),
+			route.Name, hdr[":method"], hdr[":authority"], hdr[":path"], hdr)
+		nonce := "0x" + hexEncode(payment.Auth.Nonce[:])
+		d := s.redelivered(ctx, route.Name, key)
+		if d == nil && route.Sync {
+			// Only sync routes keep answers, so only there is a first
+			// call worth waiting for.
+			d = s.claimOrWait(ctx, t, route, key, arrived)
+		}
+		if d != nil && s.unlocks(ctx, d, payment.Offer.Wire.Network, payment.Offer.Domain.VerifyingContract.Hex(), payment.Payer.Hex(), nonce) {
+			// The same payer, the same request, a moment after a charged
+			// answer: the kept answer again. The new payment is not
+			// reserved, so it is never charged.
+			s.log.Info("paid answer redelivered; new payment not charged", "route", route.Name, "payer", payment.Payer.Hex())
+			return redeliverResponse(d), metrics.DecisionRedelivered
+		}
+		t.redeliverKey = key
 	}
 
 	id, basis, err := s.reserve(ctx, payerstate.Request{
@@ -428,6 +477,9 @@ func (s *Server) onResponseHeaders(ctx context.Context, t *txn, h *extprocv3.Htt
 			// Charge on the body, once it has been checked. Envoy holds the
 			// headers until then.
 			t.plan, t.awaitBody, t.heldAt = p, true, time.Now()
+			if t.redeliverKey != "" {
+				t.answerHdr, t.answerStatus = indexHeaders(h.GetHeaders()), code
+			}
 			r := continueResponse(nil)
 			r.ModeOverride = &extprocfilterv3.ProcessingMode{
 				ResponseBodyMode:    extprocfilterv3.ProcessingMode_BUFFERED_PARTIAL,
@@ -459,7 +511,161 @@ func (s *Server) onResponseBody(ctx context.Context, t *txn, b *extprocv3.HttpBo
 	if imm != nil {
 		return imm
 	}
+	if t.answerHdr != nil && b.GetEndOfStream() && !refusing(v) {
+		s.keep(t, b.GetBody(), set)
+	}
 	return bodyResponse(set)
+}
+
+// redelivered looks up a kept answer. A store that cannot answer means
+// none: the request is charged as usual.
+func (s *Server) redelivered(ctx context.Context, route, key string) *Delivered {
+	ctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	d, err := s.redeliver.Get(ctx, key)
+	if err != nil {
+		s.log.Warn("redelivery lookup failed; charging as usual", "route", route, "err", err)
+		return nil
+	}
+	if d == nil || d.Status < 200 || d.Status > 299 || d.PaymentResponse == "" {
+		return nil
+	}
+	return d
+}
+
+// claimOrWait marks this request as in flight, or, when the same payer's
+// same request already is (a client that timed out and retried while the
+// first call is still being answered), waits for that answer to be kept and
+// returns it. It returns nil when this request is the first, when the first
+// ends without a kept answer, or when the wait runs out: then the request
+// is charged as usual. The wait is bounded by the route's settlement wait,
+// which the controller's message timeout for sync routes covers.
+func (s *Server) claimOrWait(ctx context.Context, t *txn, route *pricing.Route, key string, arrived time.Time) *Delivered {
+	token := newFlightToken()
+	cctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	claimed, err := s.redeliver.Claim(cctx, key, token, flightTTL)
+	cancel()
+	if err != nil {
+		return nil
+	}
+	if claimed {
+		t.claimed, t.flightToken = true, token
+		return nil
+	}
+	// The whole request phase (verification, this wait, the reservation)
+	// has the route's message timeout, at least the settlement wait plus
+	// two seconds: the wait gets what verification left of the settlement
+	// wait, so the reservation keeps its two seconds.
+	wait := min(route.SyncTimeout, pricing.DefaultSyncTimeout) - time.Since(arrived)
+	if wait <= 0 || !s.waiters.enter(key) {
+		// No time left, or too many repeats already waiting: this one is
+		// charged as usual rather than add to the load on the store.
+		return nil
+	}
+	defer s.waiters.leave(key)
+	start := time.Now()
+	ctx, cancel = context.WithTimeout(ctx, wait)
+	defer cancel()
+	poll := flightPoll
+	timer := time.NewTimer(poll)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			s.log.Info("repeat waited for the paid answer in flight; none came, charging as usual", "route", route.Name, "waited", time.Since(start))
+			return nil
+		case <-timer.C:
+		}
+		// Back off: a quick first answer is found quickly, a slow one costs
+		// the store a few lookups a second.
+		poll = min(2*poll, flightPollMax)
+		timer.Reset(poll)
+		if d := s.redelivered(ctx, route.Name, key); d != nil {
+			s.log.Info("repeat waited for the paid answer in flight", "route", route.Name, "waited", time.Since(start))
+			return d
+		}
+		if busy, err := s.redeliver.InFlight(ctx, key); err != nil || !busy {
+			// The first call ended without keeping an answer (refused, an
+			// error, not settled): this one is a call of its own.
+			return s.redelivered(ctx, route.Name, key)
+		}
+	}
+}
+
+// unclaim removes the in-flight mark of a request that ends without an
+// answer being kept (a kept answer removes it once stored).
+func (s *Server) unclaim(t *txn) {
+	if !t.claimed || t.keeping {
+		return
+	}
+	t.claimed = false
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := s.redeliver.Unclaim(ctx, t.redeliverKey, t.flightToken); err != nil {
+		s.log.Warn("in-flight mark not removed; it lapses by itself", "route", t.route.Name, "err", err)
+	}
+}
+
+// unlocks reports whether the payment presented may have the kept answer:
+// the payment it was charged to, resent, or one never used before (a retry
+// signs a new one). A payment already used for something else may not: it
+// is a bearer token for its own request only. A state that cannot say
+// means no.
+func (s *Server) unlocks(ctx context.Context, d *Delivered, network, asset, payer, nonce string) bool {
+	if d.Nonce == nonce {
+		return true
+	}
+	nc, ok := s.state.(nonceChecker)
+	if !ok {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	used, err := nc.NonceUsed(ctx, network, asset, payer, nonce)
+	if err != nil {
+		s.log.Warn("redelivery nonce check failed; charging as usual", "err", err)
+		return false
+	}
+	return !used
+}
+
+// keep stores a charged answer for a repeat, off the answer's path.
+func (s *Server) keep(t *txn, body []byte, set []*corev3.HeaderValueOption) {
+	var receipt string
+	for _, h := range set {
+		if strings.EqualFold(h.GetHeader().GetKey(), x402.HeaderPaymentResponse) {
+			receipt = string(h.GetHeader().GetRawValue())
+		}
+	}
+	// Only a settled payment's answer is kept (its receipt names the
+	// transaction): an answer served before settlement (async, or a sync
+	// wait that timed out) may yet go unpaid, and a free repeat must rest on
+	// a payment that is final.
+	var sr x402.SettlementResponse
+	if receipt == "" || x402.DecodeHeader(receipt, &sr) != nil || !sr.Success || sr.Transaction == "" {
+		return
+	}
+	// Only a whole, plain answer: a 200 (not a range or other partial or
+	// special 2xx), and none that the upstream says varies with request
+	// headers the key leaves out.
+	if t.answerStatus != 200 || !varyCovered(t.answerHdr["vary"]) {
+		return
+	}
+	d := &Delivered{Status: t.answerStatus, Headers: keepHeaders(t.answerHdr), Body: append([]byte(nil), body...), PaymentResponse: receipt,
+		Nonce: "0x" + hexEncode(t.payment.Auth.Nonce[:])}
+	key, route, claimed, token := t.redeliverKey, t.route.Name, t.claimed, t.flightToken
+	t.keeping = true
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := s.redeliver.Put(ctx, key, d, s.redeliverTTL); err != nil {
+			s.log.Warn("paid answer not kept for redelivery", "route", route, "err", err)
+		}
+		// After the answer is stored, so a waiting repeat finds it.
+		if claimed {
+			s.redeliver.Unclaim(ctx, key, token)
+		}
+	}()
 }
 
 // judgeAnswer acts on a checked answer's verdict: in enforce mode an
@@ -595,6 +801,8 @@ func (s *Server) release(t *txn, why string) {
 		return
 	}
 	t.finished = true
+	// Nothing will be kept: a repeat waiting on this call goes on now.
+	defer s.unclaim(t)
 	// The stream context may already be cancelled; releasing must still happen.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

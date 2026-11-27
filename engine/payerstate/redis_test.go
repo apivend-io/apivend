@@ -516,3 +516,39 @@ func TestResultWait(t *testing.T) {
 		t.Fatalf("WaitResult = %+v, %v", res, err)
 	}
 }
+
+func TestNonceUsed(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.chain.SetBalance(aliceAddr, 100_000)
+	used := func(nonce string) bool {
+		t.Helper()
+		u, err := f.state.NonceUsed(ctx, net84532, usdc, alice, nonce)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u
+	}
+	if used("0xa") {
+		t.Fatal("unseen nonce reported used")
+	}
+	id := f.reserve("0xa", 10_000)
+	if !used("0xa") {
+		t.Fatal("held nonce not reported used")
+	}
+	f.state.Release(ctx, id)
+	if used("0xa") {
+		t.Fatal("released nonce reported used")
+	}
+	id = f.reserve("0xa", 10_000)
+	if err := f.state.Commit(ctx, id, job(f)); err != nil {
+		t.Fatal(err)
+	}
+	if !used("0xa") {
+		t.Fatal("charged nonce not reported used")
+	}
+	f.advance(61 * time.Second)
+	if used("0xa") {
+		t.Fatal("expired nonce reported used")
+	}
+}

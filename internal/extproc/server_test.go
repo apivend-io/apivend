@@ -54,6 +54,12 @@ func (s *spyState) Reserve(ctx context.Context, r payerstate.Request) (payerstat
 	}
 	return s.Memory.Reserve(ctx, r)
 }
+
+// WaitResult settles every sync payment at once (only sync routes wait).
+func (s *spyState) WaitResult(ctx context.Context, _ payerstate.ReservationID, _ time.Duration) (*payerstate.Result, error) {
+	return &payerstate.Result{Status: "settled", Transaction: "0x" + strings.Repeat("ab", 32)}, nil
+}
+
 func (s *spyState) Release(ctx context.Context, id payerstate.ReservationID) error {
 	err := s.Memory.Release(ctx, id)
 	s.events <- "release"

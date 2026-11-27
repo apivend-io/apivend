@@ -32,11 +32,21 @@ you.
 - **Charges only for answers.** A reservation becomes a charge only when your
   API answers 2xx. Errors, timeouts and aborted requests cost the caller
   nothing.
-- **Protects buyers from broken answers.** Optionally, the gateway looks at
-  the form of a 2xx answer before charging: an empty body, JSON cut off, an
-  HTML page where JSON was expected, or an error dressed as a 200 is not
-  charged and never reaches the caller. Content is never judged: "no
-  results" is an answer.
+- **Protects buyers from broken answers.** The gateway looks at the form of
+  a 2xx answer before charging: an empty body, JSON cut off, an HTML page
+  where JSON was expected, or an error dressed as a 200 is not charged and
+  never reaches the caller. Content is never judged: "no results" is an
+  answer. On by default; it can watch only, or be turned off.
+- **Does not charge twice for a dropped connection.** When a caller's
+  connection drops after the charge, x402 clients retry with a new payment.
+  For a minute, the same payer repeating the same GET gets the answer it
+  already paid for, with its original receipt, and the new payment is not
+  charged. A retry that arrives while the first call is still running
+  waits for it. For routes that settle first, and JSON answers; see
+  [docs/install.md](docs/install.md#buyer-protection).
+- **Refuses what cannot be served before anyone pays.** A request missing a
+  required query parameter, a paid HEAD (headers only) and a payment to the
+  route's own payee are refused before a payment is reserved.
 - **Settles after the response, or before it.** By default the response goes
   out first and the payment settles about a second later, with a cap on what
   any one payer can owe in the meantime. A route can instead settle first and
@@ -61,7 +71,7 @@ claimed in batches). See [docs/BATCH-SETTLEMENT.md](docs/BATCH-SETTLEMENT.md).
 
 ## Status
 
-**v0.6: early.** The gateway has served and settled real payments on Base
+**v0.7: early.** The gateway has served and settled real payments on Base
 Sepolia and on Base mainnet, behind Envoy Gateway on Kubernetes. It has not
 run at volume yet. What has been tested, and against what, is in
 [docs/status.md](docs/status.md).
@@ -76,7 +86,7 @@ On Kubernetes with Envoy Gateway, the Helm chart installs the filter, the
 settler and the controller:
 
 ```sh
-helm install x402 oci://ghcr.io/apivend-io/charts/x402 --version 0.6.0 \
+helm install x402 oci://ghcr.io/apivend-io/charts/x402 --version 0.7.0 \
   -n x402-system --create-namespace \
   --set redis.url=redis://redis.x402-system.svc:6379/0
 ```

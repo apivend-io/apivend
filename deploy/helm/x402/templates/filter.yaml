@@ -81,9 +81,13 @@ spec:
             - -min-validity-remaining={{ .Values.filter.minValidityRemaining }}
             - -chain-read-timeout={{ .Values.filter.chainReadTimeout }}
             - -credit-confirmations={{ .Values.filter.creditConfirmations }}
-            {{- if and .Values.filter.answerCheck (ne (toString .Values.filter.answerCheck) "off") }}
-            - -answer-check={{ .Values.filter.answerCheck }}
+            {{- $answerCheck := .Values.filter.answerCheck }}
+            {{- if kindIs "bool" $answerCheck }}
+            {{- /* An unquoted off is YAML false: keep its meaning. */}}
+            {{- if $answerCheck }}{{ fail "filter.answerCheck must be \"enforce\", \"watch\" or \"off\" (quoted)" }}{{ end }}
+            {{- $answerCheck = "off" }}
             {{- end }}
+            - -answer-check={{ $answerCheck | default "enforce" }}
             {{- with .Values.filter.refuseUnpricedRoutes }}
             - -refuse-unpriced-routes={{ join "," . }}
             {{- end }}
@@ -96,6 +100,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- /* 0 (a number) turns it off too; only empty means the default. */}}
+            {{- $redeliverWindow := .Values.filter.redeliverWindow }}
+            {{- if not (or (kindIs "invalid" $redeliverWindow) (eq (toString $redeliverWindow) "")) }}
+            - name: X402_REDELIVER_WINDOW
+              value: {{ $redeliverWindow | toString | quote }}
+            {{- end }}
             {{- include "x402.redisEnv" . | nindent 12 }}
             {{- include "x402.rpcEnv" . | nindent 12 }}
             {{- if .Values.hostedState.url }}

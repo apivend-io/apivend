@@ -197,9 +197,18 @@ check "settlement queue is empty"          test "$(rcli zcard x402:settle:queue)
 check "filter exports request metrics"     test "$(metric 9102 '^x402_requests_total\{.*decision="served"')" = 1
 check "settler exports settled revenue"    test "$(metric 9103 '^x402_settled_atomic_total\{.*route="search"')" = 10000
 
-bin/x402-pay "$GW/reports/q3" >/dev/null 2>"$LOGS/sync.err" || true
+bin/x402-pay "$GW/reports/q3" >"$LOGS/sync.out" 2>"$LOGS/sync.err" || true
 check "sync route is served after settling" grep -q '^< 200' "$LOGS/sync.err"
 check "sync response names the transaction" grep -Eq 'PAYMENT-RESPONSE: \{"success":true.*"transaction":"0x[0-9a-f]{64}"' "$LOGS/sync.err"
+# A repeat of the same paid GET (a buyer whose connection dropped signs a new
+# payment): the kept answer of the settled payment, with its receipt, and the
+# new payment is never reserved or charged.
+commits=$(logged filter '"msg":"payment committed"')
+bin/x402-pay "$GW/reports/q3" >"$LOGS/again.out" 2>"$LOGS/again.err" || true
+check "repeat gets the kept answer"         bash -c "grep -q '^< 200' '$LOGS/again.err' && test -s '$LOGS/sync.out' && cmp -s '$LOGS/sync.out' '$LOGS/again.out'"
+check "repeat carries the original receipt" bash -c "diff <(grep PAYMENT-RESPONSE '$LOGS/sync.err') <(grep PAYMENT-RESPONSE '$LOGS/again.err')"
+after=$(logged filter '"msg":"payment committed"')
+check "repeat is not charged"              bash -c "grep -q 'paid answer redelivered; new payment not charged' '$LOGS/filter.log' && test '$after' = '$commits'"
 
 bin/x402-pay "$GW/doomed" >"$LOGS/doomed.out" 2>"$LOGS/doomed.err" || true
 check "failed sync payment gets 402"        grep -q '^< 402' "$LOGS/doomed.err"

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"math/big"
 	"strconv"
 	"strings"
@@ -414,6 +415,20 @@ func (r *Redis) SetSnapshot(ctx context.Context, chainID, asset, payer, source s
 func (r *Redis) MarkAuthorizationUsed(ctx context.Context, chainID, asset, payer, nonce string) error {
 	_, _, _, _, nonces, _ := payerKeys(chainID, asset, payer)
 	return markAuthScript.Run(ctx, r.rdb, []string{nonces}, nonce).Err()
+}
+
+// NonceUsed reports whether an authorization is held, charged or seen used
+// on chain, and not yet expired. A released one is not used.
+func (r *Redis) NonceUsed(ctx context.Context, chainID, asset, payer, nonce string) (bool, error) {
+	_, _, _, _, nonces, _ := payerKeys(chainID, asset, payer)
+	score, err := r.rdb.ZScore(ctx, nonces, nonce).Result()
+	if errors.Is(err, redis.Nil) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return math.IsInf(score, 1) || int64(score) > r.now().UnixMilli(), nil
 }
 
 func (r *Redis) Release(ctx context.Context, id ReservationID) error {

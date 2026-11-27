@@ -37,7 +37,8 @@ func main() {
 		configMap       = flag.String("config-configmap", "", "read the price table from this ConfigMap through the Kubernetes API instead of -config, so every replica sees a change within about a second (a mounted ConfigMap takes up to a minute, at a different moment in each pod)")
 		configKey       = flag.String("config-configmap-key", "routes.yaml", "key of the price table in -config-configmap")
 		configNS        = flag.String("config-namespace", "", "namespace of -config-configmap; default env POD_NAMESPACE, then the pod's own namespace")
-		answerCheck     = flag.String("answer-check", "off", "what to do with a paid 2xx answer before charging: off (charge on the headers), watch (check it and count the verdict, charge anyway) or enforce (an unusable answer is not charged; the buyer gets 503). watch and enforce need Envoy's ext_proc config to allow mode override")
+		answerCheck     = flag.String("answer-check", "enforce", "what to do with a paid 2xx answer before charging: enforce (an unusable answer is not charged; the buyer gets 503), watch (check it and count the verdict, charge anyway) or off (charge on the headers). watch and enforce need Envoy's ext_proc config to allow mode override")
+		redeliverWindow = flag.Duration("redeliver-window", envDuration("X402_REDELIVER_WINDOW", extproc.DefaultRedeliverWindow), "(env X402_REDELIVER_WINDOW) keep each paid GET answer the answer check held this long: the same payer repeating the same request with a new payment gets it again and is not charged twice (a dropped connection). At most 1h; 0 disables. Needs -answer-check watch or enforce")
 		answerMax       = flag.Int("answer-check-max-bytes", extproc.DefaultAnswerMaxBytes, "answers larger than this are charged unchecked")
 		refuseUnpriced  = flag.String("refuse-unpriced-routes", "", "comma-separated Envoy route-name patterns that are always priced, per-segment globs (e.g. httproute/t-*/p-*): such a route missing from the price table is refused, not served free")
 		minRemaining    = flag.Duration("min-validity-remaining", 30*time.Second, "reject authorizations that expire sooner than this")
@@ -207,8 +208,22 @@ func main() {
 		log.Error("-answer-check must be off, watch or enforce")
 		os.Exit(2)
 	}
+	var redeliver extproc.Redeliveries
+	switch {
+	case *redeliverWindow < 0 || *redeliverWindow > extproc.MaxRedeliverWindow:
+		log.Error("-redeliver-window must be between 0 and 1h")
+		os.Exit(2)
+	case *redeliverWindow == 0:
+	case stateRedis != nil:
+		redeliver = extproc.RedisRedeliveries{RDB: stateRedis}
+	default:
+		redeliver = &extproc.MemoryRedeliveries{}
+	}
+	if redeliver != nil && check == extproc.AnswerCheckOff {
+		log.Warn("-redeliver-window has no effect with -answer-check=off: only answers the check holds are kept")
+	}
 	srv := extproc.NewServer(table, state, extproc.Options{Logger: log, MinRemaining: *minRemaining, Metrics: m, Contract: contract, Channels: channels, RefuseUnpriced: refuse,
-		AnswerCheck: check, AnswerMaxBytes: *answerMax})
+		AnswerCheck: check, AnswerMaxBytes: *answerMax, Redeliveries: redeliver, RedeliverWindow: *redeliverWindow})
 
 	lis, err := net.Listen("tcp", *listen)
 	if err != nil {
@@ -268,4 +283,20 @@ func watchConfigFile(ctx context.Context, log *slog.Logger, srv *extproc.Server,
 			reload()
 		}
 	}()
+}
+
+// envDuration reads a duration default from the environment (the chart sets
+// new settings as env vars: an older image ignores them, where an unknown
+// flag would stop it).
+func envDuration(name string, def time.Duration) time.Duration {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		slog.Error("invalid duration", "env", name)
+		os.Exit(2)
+	}
+	return d
 }
